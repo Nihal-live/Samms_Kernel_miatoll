@@ -6,8 +6,9 @@ name: Build SKYNET kernel + SukiSU Nova + SUSFS (AnyKernel3 ZIP)
 #
 # The whole integration is applied by scripts/sukisu-setup.sh on every run, so
 # the build is reproducible from a clean checkout -- nothing depends on a local
-# working tree. Only two files need to be committed:
+# working tree. The files that need to be committed are:
 #   scripts/sukisu-setup.sh
+#   scripts/susfs_414_reconcile.py   (stage 6: bridge v1.5.5 patch -> v2.3.0 core)
 #   .github/workflows/build-kernel-sukisu.yml
 
 on:
@@ -41,6 +42,7 @@ on:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
       - 'scripts/sukisu-setup.sh'
+      - 'scripts/susfs_414_reconcile.py'
       - 'scripts/build.sh'
       - 'scripts/package-anykernel.sh'
       - 'arch/arm64/configs/vendor/xiaomi/miatoll_defconfig'

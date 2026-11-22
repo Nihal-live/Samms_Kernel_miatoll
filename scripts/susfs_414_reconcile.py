@@ -23,6 +23,7 @@ WHAT IT FIXES
  5. DEFAULT_SUS_MNT_* -> DEFAULT_KSU_MNT_* (+ define the one that is missing)
  6. fsnotify handle_event / fsnotify_add_mark -> 4.14 signatures
  7. missing declarations / includes
+ 8. stamps susfs_def.h with SUSFS_414_COMPAT so CI can prove the reconcile ran
 
 Run from the kernel tree root, AFTER the 4.14 patch and the v2.3.0 core are in
 place. Idempotent.
@@ -184,7 +185,7 @@ else:
 print("[2] missing macros in susfs_def.h")
 p = "include/linux/susfs_def.h"
 s = read(p)
-if "DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE" in s:
+if "SUSFS_414_COMPAT" in s:
     print("  [skip] already defined")
 else:
     anchor = "#define DEFAULT_KSU_MNT_GROUP_ID 200000"
@@ -194,9 +195,11 @@ else:
            "/* v1.5.5 name kept for the 4.14 patch's fs/namespace.c hunks */\n"
            "#define DEFAULT_SUS_MNT_GROUP_ID DEFAULT_KSU_MNT_GROUP_ID\n"
            "#define DEFAULT_SUS_MNT_ID DEFAULT_KSU_MNT_ID\n"
-           "#define DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE 2000000001")
+           "#define DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE 2000000001\n"
+           "/* marker for CI: the 4.14 reconcile ran (build-kernel-sukisu.yml checks this) */\n"
+           "#define SUSFS_414_COMPAT 1")
     write(p, s.replace(anchor, add, 1))
-    print("  [ok]   added DEFAULT_SUS_MNT_* aliases + KSU_PROC_UNSHARE")
+    print("  [ok]   added DEFAULT_SUS_MNT_* aliases + KSU_PROC_UNSHARE + SUSFS_414_COMPAT")
 
 # ============================================ 3. declare susfs_is_inode_sus_path
 print("[3] declare susfs_is_inode_sus_path in susfs_def.h")
