@@ -197,6 +197,33 @@ jobs:
           echo "--- boot artefacts ---"
           ls -lh out/arch/arm64/boot/ || true
 
+      - name: Publish build log to a branch on failure
+        # Job logs are served from blob storage, which some clients cannot
+        # reach. Pushing the failure text to a throwaway branch keeps it
+        # reachable with plain git.
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          [ -f "$LOG" ] || { echo "no build log captured"; exit 0; }
+          mkdir -p /tmp/ci-log
+          {
+            echo "# build failure on $(date -u +%FT%TZ) — $(git rev-parse --short HEAD)"
+            echo
+            echo '```'
+            grep -n -B4 -A12 -E "error:|Error [0-9]+$|undefined reference|No rule to make" "$LOG" \
+              | head -400 || tail -n 200 "$LOG"
+            echo '```'
+          } > /tmp/ci-log/build-failure.md
+          cd /tmp/ci-log
+          git init -q .
+          git checkout -q -b ci-build-log
+          git config user.name  "skynet-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git add build-failure.md
+          git commit -q -m "ci: build failure log for $GITHUB_RUN_ID"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ci-build-log
+          echo "pushed to branch ci-build-log"
+
       - name: Package AnyKernel3 ZIP
         id: package
         run: |
