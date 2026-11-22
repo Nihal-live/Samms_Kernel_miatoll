@@ -1,27 +1,21 @@
-name: Build SKYNET kernel + SukiSU-Nova + SUSFS (AnyKernel3 ZIP)
+name: Build SKYNET kernel + SukiSU-Nova root (AnyKernel3 ZIP)
 
 # Builds the miatoll 4.14.357 kernel with SukiSU-Nova (`builtin`) embedded at
-# kernel level and SUSFS v2.4.0 root hiding, then packages a flashable
-# AnyKernel3 ZIP.
+# kernel level, then packages a flashable AnyKernel3 ZIP.
 #
 # The whole integration is applied from a clean checkout by
 # scripts/ksu-nova-setup.sh on every run, so nothing depends on a local working
 # tree and the result is reproducible:
 #
-#   input (committed)                          applied at build time
-#   --------------------------------------     -------------------------------
-#   patches/susfs/susfs-4.14-v2.4.0.patch   -> fs/susfs.c, include/linux/susfs*.h,
-#                                               fs/, mm/, security/ hook hunks
-#   scripts/ksu-nova-setup.sh               -> SukiSU-Nova @ pinned commit,
-#                                               drivers/kernelsu, KSU hooks,
-#                                               defconfig symbols
+#   scripts/ksu-nova-setup.sh -> SukiSU-Nova @ pinned commit, drivers/kernelsu,
+#                                the four 4.14 hook call sites, the two Nova
+#                                4.14 fixes, and the CONFIG_KSU* symbols
 #
-# See docs/KSU-SUSFS.md for why those exact sources, and what is deliberately
-# *not* wired (the legacy faccessat/stat su hooks, for instance).
+# No SUSFS and no KPM in this flavour -- see docs/KSU-NOVA.md for why.
 #
 # The build is untested on hardware: the job proves it compiles and that
-# CONFIG_KSU / CONFIG_KSU_SUSFS actually survived into .config -- not that the
-# resulting kernel boots on your device.
+# CONFIG_KSU actually survived into .config -- not that the resulting kernel
+# boots on your device.
 
 on:
   workflow_dispatch:
@@ -60,7 +54,6 @@ on:
       - 'scripts/ksu-nova-setup.sh'
       - 'scripts/build.sh'
       - 'scripts/package-anykernel.sh'
-      - 'patches/susfs/**'
       - 'arch/arm64/configs/vendor/xiaomi/miatoll_defconfig'
       - 'anykernel3/**'
     tags:
@@ -110,20 +103,21 @@ jobs:
           done
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Apply SukiSU-Nova + SUSFS integration
+      - name: Apply SukiSU-Nova integration
         env:
           KSU_REF: ${{ inputs.ksu_ref }}
         run: |
           chmod +x scripts/ksu-nova-setup.sh
           ./scripts/ksu-nova-setup.sh
           {
-            echo "### SukiSU-Nova + SUSFS"
+            echo "### SukiSU-Nova"
             echo
             echo "| item | value |"
             echo "| --- | --- |"
             echo "| SukiSU-Nova | \`$(git -C KernelSU rev-parse HEAD)\` |"
-            echo "| SUSFS | \`$(sed -nE 's/.*SUSFS_VERSION[[:space:]]+"([^"]+)".*/\1/p' include/linux/susfs.h | head -n1)\` |"
-            echo "| defconfig | \`$(grep -cE '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig) SUSFS options\` |"
+            echo "| defconfig | \`$(grep -cE '^CONFIG_KSU[A-Z_0-9]*=y$' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig) CONFIG_KSU* options\` |"
+            echo "| KPM | off |"
+            echo "| SUSFS | not included |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Inspect applied tree
@@ -132,13 +126,12 @@ jobs:
           ls -l drivers/kernelsu
           tail -2 drivers/Makefile
           grep -n 'kernelsu' drivers/Kconfig
-          echo "--- KSU hooks ---"
+          echo "--- KSU hooks (setresuid must be in setresuid, not setregid) ---"
           grep -c 'ksu_handle' fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c
-          echo "--- SUSFS wiring ---"
-          grep -n 'susfs' fs/Makefile
-          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
+          grep -A2 'SYSCALL_DEFINE3(setresuid, uid_t, ruid' kernel/sys.c
+          grep -A2 'SYSCALL_DEFINE2(setregid, gid_t, rgid' kernel/sys.c
           echo "--- defconfig ---"
-          grep -E '^CONFIG_KSU' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS|^# CONFIG_KPM' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 
       - name: Verify in-tree source
         run: ./scripts/verify-source.sh
@@ -153,23 +146,25 @@ jobs:
           ./scripts/build.sh --clang-dir "$HOME/clang/bin" \
             --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}"
 
-          echo "--- CONFIG_KSU / SUSFS in generated .config ---"
+          echo "--- CONFIG_KSU in generated .config ---"
           # An option whose Kconfig dependency is unmet is dropped silently by
           # olddefconfig, which is exactly how you end up shipping a kernel
-          # that looks patched and hides nothing. Assert every symbol the
-          # defconfig asks for actually made it.
+          # that looks patched and has no root. Assert what the defconfig asks
+          # for actually made it.
           grep -E '^CONFIG_(KSU|KALLSYMS)' out/.config || {
             echo "::error::CONFIG_KSU did not survive into .config"; exit 1; }
-          for sym in CONFIG_KSU CONFIG_KSU_SUSFS; do
-            grep -qx "$sym=y" out/.config || {
-              echo "::error::$sym is not =y in .config"; exit 1; }
-          done
           while read -r sym; do
             grep -qx "$sym" out/.config || {
               echo "::error::defconfig symbol $sym was dropped from .config"; exit 1; }
-          done < <(grep -E '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' \
+          done < <(grep -E '^CONFIG_KSU[A-Z_0-9]*=y$' \
                      arch/arm64/configs/vendor/xiaomi/miatoll_defconfig)
-          echo "all $(grep -cE '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' out/.config) SUSFS options survived"
+          if grep -qx 'CONFIG_KPM=y' out/.config; then
+            echo "::error::KPM must stay off on 4.14"; exit 1
+          fi
+          if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+            echo "::error::SUSFS symbols found but SUSFS is not part of this build"; exit 1
+          fi
+          echo "CONFIG_KSU survived; KPM off; no SUSFS symbols"
 
           echo "--- kernel.release ---"
           REL="$(cat out/include/config/kernel.release 2>/dev/null || printf 'unknown')"
@@ -184,7 +179,7 @@ jobs:
       - name: Package AnyKernel3 ZIP
         id: package
         run: |
-          NAME="skynet-17-sukisu-nova-susfs-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          NAME="skynet-17-sukisu-nova-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           ./scripts/package-anykernel.sh --name "$NAME" \
             --out "$GITHUB_WORKSPACE/$NAME.zip"
           sha256sum "$NAME.zip" | tee "$NAME.zip.sha256"
@@ -192,7 +187,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: skynet-kernel-sukisu-nova-susfs-zip
+          name: skynet-kernel-sukisu-nova-zip
           path: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256
@@ -207,14 +202,14 @@ jobs:
           body: |
             ## UNTESTED — hardware validation required
 
-            Kernel with **SukiSU-Nova** (`builtin`, source-integrated) and
-            **SUSFS v2.4.0** root hiding, built by
-            `Build SKYNET kernel + SukiSU-Nova + SUSFS`.
+            Kernel with **SukiSU-Nova** (`builtin`, source-integrated, kernel-level
+            root), built by `Build SKYNET kernel + SukiSU-Nova root`.
 
             | item | value |
             | --- | --- |
             | SukiSU-Nova | committed in `scripts/ksu-nova-setup.sh` (`KSU_REF`) |
-            | SUSFS | v2.4.0 (`patches/susfs/susfs-4.14-v2.4.0.patch`) |
+            | root hiding | none (no SUSFS in this flavour) |
+            | KPM | off |
             | source | `${{ github.sha }}` on `${{ github.ref_name }}` |
 
             **Not boot-tested on any miatoll device.** Back up `boot`, `dtbo`,
@@ -223,10 +218,6 @@ jobs:
 
             Install the **SukiSU-Nova** manager — an older SukiSU Ultra manager
             will report "kernel update required".
-
-            SUSFS needs a matching userspace module: use a `ksu_susfs` build
-            that speaks the **v2.4.0** protocol. A v1.5.x module reports the
-            kernel as unsupported.
           files: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256

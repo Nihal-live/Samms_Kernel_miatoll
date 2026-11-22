@@ -62,19 +62,28 @@ Defaults: source at the repository root, output `out/`, defconfig
 `KERNEL_DIR`, `OUT_DIR`, `DEFCONFIG`, `TARGET`, `JOBS`, `CLANG_DIR`, `CROSS_COMPILE`,
 `CROSS_COMPILE_COMPAT`, `CLANG_TRIPLE`.
 
-## 3a. Root + hiding variant (SukiSU-Nova + SUSFS)
+## 3a. Root variant (SukiSU-Nova)
 
-The clean build above is the default. To build the KernelSU + SUSFS flavour, apply the integration
-to the tree first — `scripts/build.sh` and the rest of the pipeline are unchanged:
+The clean build above is the default. To build the kernel-level root flavour, apply the
+integration first:
 
-```bash
-./scripts/ksu-nova-setup.sh          # applies SukiSU-Nova + SUSFS v2.4.0, edits the defconfig
-./scripts/build.sh --clang-dir "$HOME/clang/bin" --no-polly
-grep -x 'CONFIG_KSU_SUSFS=y' out/.config     # must be =y, not dropped
+```sh
+./scripts/ksu-nova-setup.sh          # SukiSU-Nova @ pinned commit, hooks, defconfig symbols
+./scripts/ksu-nova-setup.sh --check  # verify only, change nothing
 ```
 
-`--check` re-verifies an already-integrated tree without changing it. The sources, versions and the
-reasons behind them are in [`KSU-SUSFS.md`](KSU-SUSFS.md).
+It needs network access to fetch the pinned SukiSU-Nova commit (skip with an existing `KernelSU/`
+clone). Then build as usual and confirm the config survived:
+
+```sh
+./scripts/build.sh --clang-dir <clang>/bin --no-polly
+grep -x 'CONFIG_KSU=y' out/.config     # must be =y, not dropped
+grep -x '# CONFIG_KPM is not set' out/.config
+```
+
+`CONFIG_KSU` is silently dropped by `olddefconfig` if a dependency is unmet, which is why the CI
+workflow asserts it explicitly. SUSFS and KPM are not part of this flavour; the reasoning and the
+hook table are in [`KSU-NOVA.md`](KSU-NOVA.md).
 
 ## 4. Manual equivalent
 

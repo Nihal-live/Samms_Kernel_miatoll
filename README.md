@@ -2,7 +2,7 @@
 
 [![Validate](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/validate.yml/badge.svg)](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/validate.yml)
 [![Build kernel (AnyKernel3 ZIP)](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel.yml/badge.svg)](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel.yml)
-[![Build kernel + SukiSU-Nova + SUSFS](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel-sukisu.yml/badge.svg)](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel-sukisu.yml)
+[![Build kernel + SukiSU-Nova root](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel-sukisu.yml/badge.svg)](https://github.com/Saamitk/kernel_xiaomi_SM6250_SKYNET/actions/workflows/build-kernel-sukisu.yml)
 ![Kernel](https://img.shields.io/badge/kernel-4.14.357--openela-blue)
 ![Platform](https://img.shields.io/badge/platform-SM6250%20%22atoll%22-green)
 ![Line](https://img.shields.io/badge/line-17-purple)
@@ -13,11 +13,11 @@ source tree at the root** plus the SKYNET documentation, build tooling, AnyKerne
 CI workflows for the **"17" line**.
 
 > **Status:** full `4.14.357-openela` source in-tree. The **default** defconfig and
-> *Build SKYNET kernel (AnyKernel3 ZIP)* stay clean / stock-like — no root or hiding
-> integrations. A second, opt-in workflow builds the **SukiSU-Nova + SUSFS** variant, where the
-> integration is applied from `patches/` and `scripts/ksu-nova-setup.sh` at build time (see
-> [KernelSU and SUSFS](#kernelsu-and-susfs)). Flashable AnyKernel3 ZIPs are built by GitHub
-> Actions; no ZIP is committed and **no build has been validated on hardware yet**.
+> *Build SKYNET kernel (AnyKernel3 ZIP)* stay clean / stock-like — no root integration.
+> A second, opt-in workflow builds the **SukiSU-Nova root** variant, where the integration is
+> applied by `scripts/ksu-nova-setup.sh` at build time (see
+> [KernelSU (SukiSU-Nova)](#kernelsu-sukisu-nova)). Flashable AnyKernel3 ZIPs are built by
+> GitHub Actions; no ZIP is committed and **no build has been validated on hardware yet**.
 
 ## Where the kernel source lives
 
@@ -87,15 +87,14 @@ GCC-only builds will not work. See [`docs/BUILDING.md`](docs/BUILDING.md).
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution, commit and testing rules |
 | [`docs/`](docs/) | Building, devices, branching, upstream, licensing, releasing |
 | `scripts/build.sh` | Reproducible defconfig + Clang build wrapper |
-| `scripts/ksu-nova-setup.sh` | Apply the SukiSU-Nova + SUSFS integration to a clean tree |
+| `scripts/ksu-nova-setup.sh` | Apply the SukiSU-Nova root integration to a clean tree |
 | `scripts/verify-source.sh` | Offline source + documentation pin verification |
 | `scripts/package-anykernel.sh` | Assemble the flashable AnyKernel3 ZIP |
 | `scripts/check-links.py` | CI check for broken relative Markdown links |
-| [`patches/susfs/`](patches/susfs/) | Vendored SUSFS v2.4.0 kernel patch for this 4.14 tree |
 | [`anykernel3/anykernel.sh`](anykernel3/anykernel.sh) | AnyKernel3 device/block configuration |
 | `.github/workflows/flatten-source.yml` | One-shot migration of the tree to the root |
 | `.github/workflows/build-kernel.yml` | Build kernel and publish the AnyKernel3 ZIP |
-| `.github/workflows/build-kernel-sukisu.yml` | Build the SukiSU-Nova + SUSFS variant |
+| `.github/workflows/build-kernel-sukisu.yml` | Build the SukiSU-Nova root variant |
 | `.github/workflows/validate.yml` | Docs/scripts CI |
 
 > The original `.github/workflows/Import.yml` is kept for history. It imports into a `kernel/`
@@ -124,31 +123,35 @@ Full details are in [`docs/BUILDING.md`](docs/BUILDING.md).
 | --- | --- | --- |
 | Flatten kernel source to repository root | push of that workflow / manual | One-shot: moves the tree out of `kernel/` into the root (already done, idempotent) |
 | Build SKYNET kernel (AnyKernel3 ZIP) | manual dispatch, edits to its workflow/build/packaging files, `skynet-17-*` tags | Builds the kernel, packages an AnyKernel3 ZIP, uploads the artifact, optionally publishes a Release |
-| Build SKYNET kernel + SukiSU-Nova + SUSFS | manual dispatch, edits to its workflow/setup script/patch, `skynet-17-*` tags | Applies SukiSU-Nova (`builtin`) + SUSFS v2.4.0 to a clean tree, builds, packages an AnyKernel3 ZIP |
+| Build SKYNET kernel + SukiSU-Nova root | manual dispatch, edits to its workflow/setup script, `skynet-17-*` tags | Applies SukiSU-Nova (`builtin`) to a clean tree, builds, packages an AnyKernel3 ZIP |
 | Publish SKYNET ZIP release | manual dispatch | Promotes an existing build artifact into a GitHub Release without rebuilding |
-| Validate | push / PR | Shell syntax, ShellCheck, source/pin verification, Markdown links, plus a dry run that applies the SukiSU-Nova + SUSFS integration to a clean tree |
+| Validate | push / PR | Shell syntax, ShellCheck, source/pin verification, Markdown links, plus a dry run that applies the SukiSU-Nova integration to a clean tree |
 
 **To get a flashable ZIP:** Actions → *Build SKYNET kernel (AnyKernel3 ZIP)* → *Run workflow* →
 download the `skynet-kernel-zip` artifact. To make it a permanent Release, run
 *Publish SKYNET ZIP release* with that run's ID. See [`docs/RELEASING.md`](docs/RELEASING.md).
 
-## KernelSU and SUSFS
+## KernelSU (SukiSU-Nova)
 
 Two build flavours exist, and they differ only in what is applied before `make`:
 
 | Flavour | Workflow | Contents |
 | --- | --- | --- |
 | Clean | *Build SKYNET kernel (AnyKernel3 ZIP)* | Stock-like defconfig (the committed one) |
-| Root + hiding | *Build SKYNET kernel + SukiSU-Nova + SUSFS* | SukiSU-Nova `builtin` + SUSFS v2.4.0 |
+| Root | *Build SKYNET kernel + SukiSU-Nova root* | SukiSU-Nova `builtin`, kernel-level |
 
 The root flavour is produced by [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh), which
 pins SukiSU-Nova to a commit, wires `drivers/kernelsu`, patches the four manual hook call sites a
-4.14 kernel needs, applies [`patches/susfs/susfs-4.14-v2.4.0.patch`](patches/susfs/), and injects
-the `CONFIG_KSU*` symbols into the defconfig. Nothing is committed pre-applied: a clean checkout
-stays a clean kernel tree.
+4.14 kernel needs, applies two 4.14 fixes to the clone, and injects the `CONFIG_KSU*` symbols into
+the defconfig. Nothing is committed pre-applied: a clean checkout stays a clean kernel tree.
 
-Why *those* versions, what is deliberately left unhooked, and the CI assertions that stop a
-silently broken build are documented in [`docs/KSU-SUSFS.md`](docs/KSU-SUSFS.md).
+What you get: `su`/`ksud` compat, kernel umount, sulog, ADB root, SELinux hide, shell su (adb
+only), mount hide, app profiles and extensions — all toggled from the manager.
+
+What you do not get: **SUSFS** (no maintained 4.14 port of the API SukiSU-Nova calls) and **KPM**
+(its own Kconfig help warns it may affect stability, and it needs 5.10+ interfaces). The reasoning,
+the hook table, the traps this integration defends against and the exact CI assertions are in
+[`docs/KSU-NOVA.md`](docs/KSU-NOVA.md).
 
 ## The `17` branch
 

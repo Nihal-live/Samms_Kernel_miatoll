@@ -42,34 +42,38 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 - `docs/LICENSE-NOTICE.md`: with the GPL-2.0 tree in-tree, `COPYING` is the primary license for
   kernel code and GPL-3.0 `LICENSE` covers SKYNET-authored files.
 
-### Added — KernelSU (SukiSU-Nova) + SUSFS variant
+### Added — KernelSU (SukiSU-Nova) root variant
 
 - [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh): applies **SukiSU-Nova** (`builtin`,
-  pinned commit `4bec532dd`) + **SUSFS v2.4.0** to a clean checkout — ref validation, `drivers/`
-  wiring, the four 4.14 hook call sites, the SUSFS patch and Kconfig-derived defconfig symbols.
+  pinned commit `4bec532dd`) to a clean checkout — ref validation, `drivers/` wiring, the four
+  4.14 hook call sites, two 4.14 fixes to the clone and the `CONFIG_KSU*` defconfig symbols.
   Idempotent, and `--check` re-verifies an integrated tree without changing it.
-- [`patches/susfs/susfs-4.14-v2.4.0.patch`](patches/susfs/): the SUSFS v2.4.0 kernel side rebased
-  onto this tree, applying with zero fuzz. Derived from simonpunk's susfs4ksu (GPL-2.0); see
-  [`patches/susfs/README.md`](patches/susfs/README.md) for provenance.
 - [`.github/workflows/build-kernel-sukisu.yml`](.github/workflows/build-kernel-sukisu.yml): builds
-  the root/hiding flavour and asserts that every requested `CONFIG_KSU_SUSFS_*` survived
-  `olddefconfig` into `.config`.
-- [`docs/KSU-SUSFS.md`](docs/KSU-SUSFS.md): version rationale, the traps inherited from
-  KernelSU_Action_V2 (silent ref fallback, silently dropped Kconfig symbols, toolchain traps),
-  and the two hooks that are deliberately **not** patched on 4.14.
+  the root flavour and asserts `CONFIG_KSU` / `CONFIG_KSU_FEATURE_ADBROOT` survived
+  `olddefconfig` into `.config`, that KPM stayed off, and that no SUSFS symbol leaked in.
+- [`docs/KSU-NOVA.md`](docs/KSU-NOVA.md): the feature matrix, the hook table, why SUSFS and KPM
+  are excluded, and the traps this integration defends against (silent ref fallback, silently
+  dropped Kconfig symbols, brace-shaped patch anchors, vendor SELinux backports).
 - `Validate` gained a dry-run job that applies the whole integration to a clean tree, so upstream
-  drift fails in a minute instead of after a 40-minute build.
+  drift, a hook landing in the wrong function, or a non-idempotent re-run fails in a minute instead
+  of after a 40-minute build.
 
 ### Removed
 
-- `scripts/sukisu-setup.sh` and `scripts/susfs_414_reconcile.py`: the previous approach paired the
-  v1.5.5 4.14 SUSFS patch with the v2.3.0 core and bridged the API gap with a Python rewriter. It
-  is replaced by a single v2.4.0 patch that applies cleanly, which removes the rewriter entirely.
+- **SUSFS** from this build: `patches/susfs/` (the vendored v2.4.0 4.14 patch) and
+  `docs/KSU-SUSFS.md` are gone. SUSFS needs a kernel-side port of the API SukiSU-Nova calls, and
+  no upstream branch ships one for 4.14 — maintaining a private 5,400-line rebase plus a matching
+  userspace module is not worth the boot risk it puts on the device.
+- `scripts/sukisu-setup.sh` and `scripts/susfs_414_reconcile.py`: the older approach paired the
+  v1.5.5 4.14 SUSFS patch with the v2.3.0 core and bridged the API gap with a Python rewriter.
 
 ### Notes
 
-- The committed defconfig stays **clean / stock-like** — no `CONFIG_KSU`, no root or hiding
-  integrations. The SukiSU-Nova + SUSFS flavour is opt-in and applies its config at build time.
+- The committed defconfig stays **clean / stock-like** — no `CONFIG_KSU`, no root integration.
+  The SukiSU-Nova flavour is opt-in and applies its config at build time.
+- KPM is kept off on purpose: its Kconfig help warns it may affect system stability and it needs
+  5.10+ interfaces. KPM's guard in `kernel_compat.h` is still raised to 5.10 so the dead code
+  actually compiles out.
 - No flashable ZIP is committed to the repository; none has been validated on hardware yet.
 
 ### First CI build — `skynet-17-r1` (UNTESTED, **SUPERSEDED**)

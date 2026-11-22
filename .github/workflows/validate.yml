@@ -37,21 +37,15 @@ jobs:
       - name: In-tree source and documentation pin
         run: ./scripts/verify-source.sh
 
-      - name: SUSFS patch applies to a clean tree
-        run: |
-          set -euo pipefail
-          git apply --check --whitespace=nowarn patches/susfs/susfs-4.14-v2.4.0.patch
-          echo "patch applies with zero fuzz"
-
       - name: Markdown links
         run: python3 scripts/check-links.py
 
   integration:
-    name: SukiSU-Nova + SUSFS integration (dry run)
-    # Applies the whole integration to a clean checkout and checks the result.
-    # No kernel is built here -- this catches a moved upstream ref, a changed
-    # anchor in SukiSU-Nova, or a patch that no longer applies, in about a
-    # minute instead of after a 40-minute build.
+    name: SukiSU-Nova integration (dry run)
+    # Applies the integration to a clean checkout and checks the result. No
+    # kernel is built here -- this catches a moved upstream ref, a changed
+    # anchor in SukiSU-Nova, or a hook that landed in the wrong function, in
+    # about a minute instead of after a 40-minute build.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -64,26 +58,42 @@ jobs:
       - name: Assert what was applied
         run: |
           set -euo pipefail
-          grep -q 'susfs' fs/Makefile
-          test -f fs/susfs.c
-          test -f include/linux/susfs_def.h
-          grep -q 'ksu_handle' fs/exec.c
-          grep -q 'ksu_handle' kernel/sys.c
-          grep -q 'ksu_handle' kernel/reboot.c
-          grep -q 'ksu_handle' drivers/input/input.c
-          # The faccessat/stat hooks are deliberately absent: see docs/KSU-SUSFS.md.
-          ! grep -q 'ksu_handle_faccessat\|ksu_handle_stat' fs/open.c fs/stat.c
-          grep -qx 'CONFIG_KSU=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
-          grep -qx 'CONFIG_KSU_SUSFS=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
           test -L drivers/kernelsu
+          grep -qE '^obj-\$\(CONFIG_KSU\) \+= kernelsu/$' drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
+
+          # Hooks: one call per site, and setresuid's call inside setresuid().
+          for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c; do
+            test "$(grep -c 'ksu_handle' "$f")" -eq 1
+          done
+          grep -A2 'SYSCALL_DEFINE3(setresuid, uid_t, ruid' kernel/sys.c \
+            | grep -q 'ksu_handle_setresuid(ruid, euid, suid)'
+          if grep -A6 'SYSCALL_DEFINE2(setregid, gid_t, rgid' kernel/sys.c \
+               | grep -q 'ksu_handle_setresuid'; then
+            echo "::error::setresuid hook landed in setregid()"; exit 1
+          fi
+
+          # The two Nova 4.14 fixes must be present.
+          grep -q 'KSU_CAN_USE_KPM' KernelSU/kernel/kernel_compat.h
+          grep -B1 '#include <linux/static_call.h>' KernelSU/kernel/kernel_includes.h \
+            | grep -q 'KERNEL_VERSION(5, 10, 0)'
+
+          # SUSFS and KPM must not be enabled by a build that excludes them.
+          if grep -qE '^CONFIG_KSU_SUSFS' \
+               arch/arm64/configs/vendor/xiaomi/miatoll_defconfig; then
+            echo "::error::SUSFS is enabled in a build that must not have it"; exit 1
+          fi
+          grep -qx 'CONFIG_KSU=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -qx '# CONFIG_KPM is not set' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
           echo "integration applied as expected"
 
       - name: Re-run is read-only
         run: |
           set -euo pipefail
           BEFORE=$(git status --porcelain=v1 | sort | sha256sum)
+          ./scripts/ksu-nova-setup.sh
           ./scripts/ksu-nova-setup.sh --check
           AFTER=$(git status --porcelain=v1 | sort | sha256sum)
           test "$BEFORE" = "$AFTER" || {
-            echo "::error::--check changed the working tree"; git status --porcelain; exit 1; }
-          echo "--check is read-only"
+            echo "::error::re-run changed the working tree"; git status --porcelain; exit 1; }
+          echo "re-run and --check are read-only"

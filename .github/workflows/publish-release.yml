@@ -71,7 +71,7 @@ jobs:
             Kernel version: `4.14.357-openela-SKYNET` (`CONFIG_LOCALVERSION=-SKYNET`).
             Source: Linux 4.14.357-openela, `vendor/xiaomi/miatoll_defconfig`,
             pinned at `4afc6f0769f0f3b2b10d50d3fa02f0ba7c89a183`. Clean /
-            stock-like line: no KernelSU, SUSFS or other root solution.
+            stock-like line: no KernelSU or other root solution.
             `CONFIG_LLVM_POLLY` is disabled for prebuilt Clang compatibility.
 
             See [docs/RELEASING.md](https://github.com/${{ github.repository }}/blob/main/docs/RELEASING.md)
