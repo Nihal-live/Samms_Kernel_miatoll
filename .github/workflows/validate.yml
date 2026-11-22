@@ -63,16 +63,18 @@ jobs:
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
           # Hooks: one call per site, and setresuid's call inside setresuid().
+          # Exactly one *call* per site. Counting every mention would also
+          # count the extern declaration at column 0.
           for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
                    fs/open.c fs/stat.c; do
-            test "$(grep -c 'ksu_handle' "$f")" -eq 1
+            test "$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' "$f")" -eq 1
           done
           # The call sits after the local declarations, so scan the function
           # body between syscall definitions rather than a fixed line count.
-          awk '/^SYSCALL_DEFINE3\\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-               f && /ksu_handle_setresuid\\(/{found=1} END{exit !found}' kernel/sys.c
-          if awk '/^SYSCALL_DEFINE2\\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-                  f && /ksu_handle_setresuid\\(/{found=1} END{exit !found}' kernel/sys.c; then
+          awk '/^SYSCALL_DEFINE3\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+               f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
+          if awk '/^SYSCALL_DEFINE2\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+                  f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c; then
             echo "::error::setresuid hook landed in setregid()"; exit 1
           fi
 
