@@ -63,24 +63,35 @@ jobs:
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
           # Hooks: one call per site, and setresuid's call inside setresuid().
-          # Exactly one *call* per site. Counting every mention would also
-          # count the extern declaration at column 0.
+          # Hooks: at most one call per site, and the execve hook (what `su`
+          # rides on) must be there. kernel/sys.c is legitimately empty:
+          # ksu_handle_setresuid() only exists in the SUSFS build, so the
+          # setup script skips that hook.
           for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
                    fs/open.c fs/stat.c; do
-            test "$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' "$f")" -eq 1
+            # grep -c exits 1 on zero matches; the zero case is expected here.
+            n=$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' "$f" || true)
+            test "$n" -le 1 || { echo "::error::duplicate hook in $f"; exit 1; }
           done
-          awk 'BEGIN{f=0;found=0}
-               /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
-               f && index($0, "ksu_handle_setresuid(") { found=1 }
-               END { exit !found }' kernel/sys.c
-          if awk 'BEGIN{f=0;found=0}
-                  /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
-                  f && index($0, "ksu_handle_setresuid(") { found=1 }
-                  END { exit !found }' kernel/sys.c; then
-            echo "::error::setresuid hook landed in setregid()"; exit 1
+          test "$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' fs/exec.c || true)" -eq 1
+          for f in fs/exec.c kernel/reboot.c drivers/input/input.c fs/open.c fs/stat.c; do
+            test "$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' "$f" || true)" -eq 1 \
+              || { echo "::error::hook missing in $f"; exit 1; }
+          done
+          # A hook is only inserted when the symbol is really defined; if it is,
+          # it must not be in the neighbouring setregid().
+          if grep -q 'ksu_handle_setresuid' kernel/sys.c; then
+            awk 'BEGIN{f=0;found=0}
+                 /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
+                 f && index($0, "ksu_handle_setresuid(") { found=1 }
+                 END { exit !found }' kernel/sys.c
+            if awk 'BEGIN{f=0;found=0}
+                    /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
+                    f && index($0, "ksu_handle_setresuid(") { found=1 }
+                    END { exit !found }' kernel/sys.c; then
+              echo "::error::setresuid hook landed in setregid()"; exit 1
+            fi
           fi
-          # The call sits after the local declarations, so scan the function
-          # body between syscall definitions rather than a fixed line count.
 
           # The two Nova 4.14 fixes must be present.
           grep -q 'KSU_CAN_USE_KPM' KernelSU/kernel/kernel_compat.h

@@ -253,33 +253,32 @@ grep -q 'KSU_CAN_USE_KPM' "$KSU_DIR/kernel/kernel_compat.h" || die "KPM guard va
 #
 # SukiSU-Nova's `builtin` ref is source-integrated: the kernel has to call its
 # entry points itself. The signatures below are the ones its headers declare
-# for a 4.14 kernel (kernel/feature/sucompat.h, kernel/hook/*.h).
+# for a 4.14 kernel with CONFIG_KSU_SUSFS off (kernel/feature/sucompat.h).
+#
+# A hook is only inserted when the clone actually *defines* the symbol outside
+# a CONFIG_KSU_SUSFS block. ksu_handle_setresuid() is the case that matters:
+# it exists only in the SUSFS build (it drives SUSFS's zygote handling), so
+# inserting the call unconditionally links a kernel with an undefined symbol
+# -- which is exactly what happened before this check existed.
 #
 # Every anchor is the full function signature, not just the opening brace, and
 # the insertion is re-checked by offset afterwards. A brace-shaped anchor is
 # how the setresuid hook once landed in setregid(): both bodies open with the
-# same three lines, and the first match wins.
-#
-# faccessat and vfs_statx are hooked too: they are what makes an app's
-# stat()/access() of /system/bin/su resolve to the su wrapper. Their signatures
-# only line up because CONFIG_KSU_SUSFS is off -- with SUSFS enabled the same
-# handlers take a `struct filename **`, which 4.14's `const char __user *` is
-# not, and passing it compiles (separate TU) and corrupts memory at runtime.
-# The defconfig assertion below keeps SUSFS off for exactly this reason.
+# same declarations, and the first match wins.
 #
 # NOT hooked: ksu_handle_vfs_read (ksu_vfs_read_hook) -- the read-side hook is
 # only needed by the legacy syscall-su path this ref does not use.
 
 if [[ "$MODE" != check ]]; then
-    python3 - <<'PY'
+    python3 - "$KSU_DIR/kernel" <<'PY'
+import os
+import re
 import sys
 
-# (file, extern block, declaration anchor, insert-after anchor, call block, label)
-#
-# The call is inserted *after* the local declarations, not right after the
-# opening brace: the kernel builds with -Wdeclaration-after-statement, and a
-# statement before the declarations is the one thing here that a stricter
-# downstream -Werror would reject.
+KSU = sys.argv[1]
+
+# (file, extern block, declaration anchor, insert-after anchor, call block,
+#  symbol, label)
 HOOKS = [
     (
         "fs/exec.c",
@@ -296,6 +295,7 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
         "#endif\n",
+        "ksu_handle_execveat",
         "fs/exec.c do_execveat_common -> ksu_handle_execveat()",
     ),
     (
@@ -314,6 +314,7 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
         "#endif\n",
+        "ksu_handle_sys_reboot",
         "kernel/reboot.c reboot -> ksu_handle_sys_reboot()",
     ),
     (
@@ -332,6 +333,7 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_setresuid(ruid, euid, suid);\n"
         "#endif\n",
+        "ksu_handle_setresuid",
         "kernel/sys.c setresuid -> ksu_handle_setresuid()",
     ),
     (
@@ -348,6 +350,7 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_input_handle_event(&type, &code, &value);\n"
         "#endif\n",
+        "ksu_handle_input_handle_event",
         "drivers/input/input.c input_handle_event -> ksu_handle_input_handle_event()",
     ),
     (
@@ -369,6 +372,7 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
         "#endif\n",
+        "ksu_handle_faccessat",
         "fs/open.c faccessat -> ksu_handle_faccessat()",
     ),
     (
@@ -386,12 +390,68 @@ HOOKS = [
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_stat(&dfd, &filename, &flags);\n"
         "#endif\n",
+        "ksu_handle_stat",
         "fs/stat.c vfs_statx -> ksu_handle_stat()",
     ),
 ]
 
+
+def symbol_available(sym):
+    """Is sym defined in a translation unit the SUSFS-free build compiles?
+
+    Walks the clone's .c files with a tiny conditional tracker: a definition
+    inside `#ifdef CONFIG_KSU_SUSFS` (or an `#if defined(CONFIG_KSU_SUSFS...)`)
+    is not built here, so calling it would leave an undefined symbol at link
+    time. Crude on purpose -- it only has to understand the guards KernelSU
+    actually uses.
+    """
+    defn = re.compile(r'^\s*(?:[A-Za-z_][\w \t\*]*[\s\*])?%s\s*\(' % re.escape(sym))
+    susfs_re = re.compile(r'CONFIG_KSU_SUSFS')
+
+    for root, _dirs, files in os.walk(KSU):
+        for name in files:
+            if not name.endswith('.c'):
+                continue
+            path = os.path.join(root, name)
+            dead = []          # stack of "this branch is not compiled"
+            skip_branch = None  # conditional we are inside, for #else
+            try:
+                handle = open(path, errors='ignore')
+            except OSError:
+                continue
+            with handle:
+                for line in handle:
+                    stripped = line.lstrip()
+                    if stripped.startswith('#'):
+                        directive = stripped[1:].strip()
+                        word = directive.split('(')[0].split()[0] if directive else ''
+                        if word in ('ifdef', 'ifndef', 'if'):
+                            if word == 'if':
+                                negated = '!defined(CONFIG_KSU_SUSFS' in directive
+                                hits = susfs_re.search(directive) is not None
+                                skip_branch = hits and not negated
+                            elif word == 'ifdef':
+                                skip_branch = 'CONFIG_KSU_SUSFS' in directive
+                            else:                        # ifndef
+                                skip_branch = 'CONFIG_KSU_SUSFS' not in directive
+                            dead.append(bool(skip_branch))
+                        elif word == 'else' and dead:
+                            dead[-1] = not dead[-1]
+                        elif word == 'elif' and dead:
+                            dead[-1] = True
+                        elif word == 'endif' and dead:
+                            dead.pop()
+                        continue
+                    if any(dead):
+                        continue
+                    if defn.match(line):
+                        return True
+    return False
+
+
+skipped = []
 failed = False
-for path, extern, decl_anchor, after_anchor, call, label in HOOKS:
+for path, extern, decl_anchor, after_anchor, call, sym, label in HOOKS:
     try:
         src = open(path).read()
     except FileNotFoundError:
@@ -401,6 +461,12 @@ for path, extern, decl_anchor, after_anchor, call, label in HOOKS:
 
     if call in src:
         print("[ksu-nova]   ok: %s (already patched)" % label)
+        continue
+
+    if not symbol_available(sym):
+        print("[ksu-nova]   skip: %s -- %s is not defined in this "
+              "configuration" % (label, sym))
+        skipped.append(sym)
         continue
 
     bad = False
@@ -421,11 +487,10 @@ for path, extern, decl_anchor, after_anchor, call, label in HOOKS:
     # follows it where there is one.
     at = src.index(after_anchor) + len(after_anchor)
     if src[at:at + 1] == "\n":
-        at += 1            # anchor ended on "{\n" / a declaration line
+        at += 1
     src = src[:at] + call + src[at:]
 
-    # The call must sit inside the function we aimed at: after its signature
-    # and before the next function starts.
+    # The call must sit inside the function we aimed at.
     call_at = src.index(call)
     if not (decl_at < call_at <= decl_at + 2000):
         print("[ksu-nova] ERROR: %s hook landed outside its function" % path)
@@ -435,38 +500,49 @@ for path, extern, decl_anchor, after_anchor, call, label in HOOKS:
     open(path, "w").write(src)
     print("[ksu-nova]   patched %s" % label)
 
+if skipped:
+    print("[ksu-nova]   note: skipped hooks for %s (not built without "
+          "CONFIG_KSU_SUSFS)" % ", ".join(skipped))
 if failed:
     sys.exit("[ksu-nova] ERROR: hook patch incomplete, see above")
 PY
 fi
 
-# Confirm the entry points this kernel calls actually exist in the clone, so a
-# rebase of SukiSU-Nova cannot leave us calling a function with a new signature.
-for sym in ksu_handle_execveat ksu_handle_sys_reboot ksu_handle_setresuid \
-           ksu_handle_input_handle_event ksu_handle_faccessat ksu_handle_stat; do
-    grep -rqs "$sym" "$KSU_DIR/kernel" || die "$sym not found in $KSU_DIR/kernel"
-done
+# su itself depends on the execve hook; that one is mandatory.
+grep -q 'ksu_handle_execveat' fs/exec.c || die "execve hook missing in fs/exec.c"
+
+# Whatever a file does call must be defined: this is the check that would have
+# caught the undefined ksu_handle_setresuid at link time instead of 15 minutes
+# into a CI build.
 for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
          fs/open.c fs/stat.c; do
-    grep -q 'ksu_handle' "$f" || die "hook missing in $f"
+    for sym in $(sed -nE 's/^[[:space:]]+(ksu_handle_[a-z_]+)\(.*/\1/p' "$f"); do
+        grep -rqs "^[A-Za-z_].*[[:space:]*]$sym(" "$KSU_DIR/kernel" \
+            || die "$f calls $sym but the clone does not define it"
+    done
 done
+
 # setresuid must be in setresuid(), not in the neighbouring setregid(), which
-# opens with the same three lines. Scan the function body between syscall
-# definitions instead of a fixed number of lines: the call sits after the local
-# declarations, so its distance from the signature is not fixed.
+# opens with the same declarations. Only relevant when that hook exists.
 inside_setresuid() {
-    awk '/^SYSCALL_DEFINE3\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-         f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
+    awk 'BEGIN{f=0;found=0}
+         /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
+         f && index($0, "ksu_handle_setresuid(") { found=1 }
+         END { exit !found }' kernel/sys.c
 }
 inside_setregid() {
-    awk '/^SYSCALL_DEFINE2\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-         f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
+    awk 'BEGIN{f=0;found=0}
+         /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
+         f && index($0, "ksu_handle_setresuid(") { found=1 }
+         END { exit !found }' kernel/sys.c
 }
-inside_setresuid || die "ksu_handle_setresuid() is not inside setresuid()"
-if inside_setregid; then
-    die "ksu_handle_setresuid() landed in setregid()"
+if grep -q 'ksu_handle_setresuid' kernel/sys.c; then
+    inside_setresuid || die "ksu_handle_setresuid() is not inside setresuid()"
+    if inside_setregid; then
+        die "ksu_handle_setresuid() landed in setregid()"
+    fi
 fi
-ok "manual hook call sites in place (exec, faccessat, stat, reboot, setresuid, input)"
+ok "manual hook call sites in place ($(grep -l 'ksu_handle' fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c fs/open.c fs/stat.c | wc -l) files)"
 
 # -------------------------------------------------------------- 5. defconfig ---
 

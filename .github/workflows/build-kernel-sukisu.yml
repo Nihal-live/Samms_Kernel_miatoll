@@ -126,9 +126,19 @@ jobs:
           ls -l drivers/kernelsu
           tail -2 drivers/Makefile
           grep -n 'kernelsu' drivers/Kconfig
-          echo "--- KSU hooks (setresuid must be in setresuid, not setregid) ---"
+          echo "--- KSU hooks (call sites per file; kernel/sys.c is expected empty) ---"
           grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' fs/exec.c kernel/reboot.c \
                    kernel/sys.c drivers/input/input.c fs/open.c fs/stat.c
+          # Every symbol a hooked file calls must be defined in the clone: this
+          # is what catches an undefined ksu_handle_* before the linker does.
+          for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
+                   fs/open.c fs/stat.c; do
+            for sym in $(sed -nE 's/^[[:space:]]+(ksu_handle_[a-z_]+)\(.*/\1/p' "$f"); do
+              grep -rqs "^[A-Za-z_].*[[:space:]*]$sym(" KernelSU/kernel \
+                || { echo "::error::$f calls $sym, which the clone does not define"; exit 1; }
+            done
+          done
+          echo "hook symbols all defined"
           awk 'BEGIN{f=0}
                /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
                f && index($0, "ksu_handle_setresuid(") { print "  " $0 }' kernel/sys.c

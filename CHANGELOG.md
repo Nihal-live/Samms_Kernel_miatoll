@@ -45,8 +45,9 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 ### Added — KernelSU (SukiSU-Nova) root variant
 
 - [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh): applies **SukiSU-Nova** (`builtin`,
-  pinned commit `4bec532dd`) to a clean checkout — ref validation, `drivers/` wiring, the four
-  4.14 hook call sites, two 4.14 fixes to the clone and the `CONFIG_KSU*` defconfig symbols.
+  pinned commit `4bec532dd`) to a clean checkout — ref validation, `drivers/` wiring, the 4.14
+  hook call sites it can prove are linkable, two 4.14 fixes to the clone and the `CONFIG_KSU*`
+  defconfig symbols.
   Idempotent, and `--check` re-verifies an integrated tree without changing it.
 - [`.github/workflows/build-kernel-sukisu.yml`](.github/workflows/build-kernel-sukisu.yml): builds
   the root flavour and asserts `CONFIG_KSU` / `CONFIG_KSU_FEATURE_ADBROOT` survived

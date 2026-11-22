@@ -23,7 +23,7 @@ tree:
 3. **Apply two 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
    exist before 5.10) and raise the KPM guard from 4.4 to 5.10 so KPM's dead
    code is actually dead.
-4. **Insert the six manual hook call sites** a 4.14 kernel needs — see
+4. **Insert the manual hook call sites** a 4.14 kernel needs — see
    [Hooks](#hooks).
 5. **Inject the defconfig symbols** — `CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
    `CONFIG_KALLSYMS_ALL`, plus explicit `# CONFIG_KPM is not set` and
@@ -78,10 +78,16 @@ vendored patch.
 | --- | --- | --- |
 | `fs/exec.c` | `do_execveat_common()` | `ksu_handle_execveat()` |
 | `kernel/reboot.c` | `SYSCALL_DEFINE4(reboot)` | `ksu_handle_sys_reboot()` |
-| `kernel/sys.c` | `SYSCALL_DEFINE3(setresuid)` | `ksu_handle_setresuid()` |
 | `drivers/input/input.c` | `input_handle_event()` | `ksu_handle_input_handle_event()` |
 | `fs/open.c` | `SYSCALL_DEFINE3(faccessat)` | `ksu_handle_faccessat()` |
 | `fs/stat.c` | `vfs_statx()` | `ksu_handle_stat()` |
+
+Five sites, not six: `ksu_handle_setresuid()` exists **only in the SUSFS
+build** (it drives SUSFS's zygote handling), so the setup script detects that
+and skips the hook instead of calling a symbol that will not link. The script
+checks every symbol a hooked file calls against the clone before writing the
+call, which is what turns that class of mistake into a one-second failure
+instead of a 15-minute build that ends in `undefined symbol`.
 
 The last two are what make an app's `access()`/`stat()` of `/system/bin/su`
 resolve to the su wrapper, so `which su` and Termux-style probing work. Their
