@@ -150,9 +150,12 @@ struct filename *susfs_get_redirected_path(unsigned long ino)
 }
 #endif /* CONFIG_KSU_SUSFS_OPEN_REDIRECT */
 
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-/* v2.3.0's susfs.c calls these; upstream defines them in the fs/namespace.c
- * hunk of the 4.9 patch, which we do not apply. */
+/* v2.3.0's susfs.c calls these from susfs_mark_inode_sus_kstat(), which
+ * is compiled under CONFIG_KSU_SUSFS_SUS_KSTAT -- NOT SUS_MOUNT. Define them
+ * unconditionally or a SUS_KSTAT-without-SUS_MOUNT build (and any
+ * SUSFS_DISABLE bisect of SUS_MOUNT) fails at link with undefined
+ * reference. They only use lock_mount_hash()/real_mount()/DEFAULT_KSU_MNT_ID,
+ * none of which depend on SUSFS_SUS_MOUNT. */
 int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)
 {
 	struct mount *mnt = orig_mnt;
@@ -183,8 +186,6 @@ struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
 	unlock_mount_hash();
 	return &mnt->mnt;
 }
-#endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
-
 /* SukiSU Nova's sepolicy.c calls this unconditionally under CONFIG_KSU_SUSFS,
  * but no SUSFS release defines it. It is a bookkeeping hook for the avtab
  * "allowed" cache; a no-op is correct and safe. */

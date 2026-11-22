@@ -76,6 +76,14 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   execve is no longer swapped to an `.init.rodata` static-ELF runner, matching
   the known-booting Nova-only build's PID-1 flow. Exposed as the `ksu_no_preinit`
   workflow input (default `false`).
+- Fixed the bisect knob path: the 4.14 compat layer defined
+  `susfs_get_non_sus_mnt_id_from_mnt()` / `susfs_get_non_sus_vfsmnt_from_vfsmnt()`
+  only under `CONFIG_KSU_SUSFS_SUS_MOUNT`, while `susfs_mark_inode_sus_kstat()`
+  (built under `CONFIG_KSU_SUSFS_SUS_KSTAT`) calls them unguarded — so any build
+  with SUS_MOUNT off (the #5/#6-era config, and every `susfs_disable` bisect that
+  drops SUS_MOUNT) failed at link with undefined reference. They are now defined
+  unconditionally; they need only `lock_mount_hash()`, `real_mount()` and
+  `DEFAULT_KSU_MNT_ID`.
 - `scripts/sukisu-setup.sh` gained `SUSFS_DISABLE` (space-separated symbols, e.g.
   `SUSFS_DISABLE="CONFIG_KSU_SUSFS_SUS_MOUNT"` or `"CONFIG_KSU_SUSFS"` for a Nova-only control
   build): matching defconfig symbols are written as `# CONFIG_X is not set` (Kconfig default is
