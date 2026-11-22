@@ -48,12 +48,16 @@ SUSFS_CORE_REPO="${SUSFS_CORE_REPO:-https://github.com/wxx9248/susfs4ksu}"
 SUSFS_CORE_REF="${SUSFS_CORE_REF:-71345ded5af28f55d76ebcdc7a9df9cea56111e1}"  # kernel-4.9-v2 HEAD (v2.3.0 port)
 SUSFS_CORE_DIR="${SUSFS_CORE_DIR:-/tmp/susfs-core}"
 
-SUSFS_PATCH_REPO="${SUSFS_PATCH_REPO:-https://gitlab.com/simonpunk/susfs4ksu}"
-# The ONLY native 4.14 SUSFS patch lives on GitLab upstream (v1.5.5-era); there
-# is no GitHub mirror. It tracks a moving branch, so the build cannot succeed
-# while gitlab.com is unreachable. To freeze a known-good revision add a full
-# 40-char SHA to SUSFS_PATCH_REF (fetch_pinned handles SHAs).
-SUSFS_PATCH_REF="${SUSFS_PATCH_REF:-kernel-4.14}"
+# The only native 4.14 SUSFS patch lives in upstream simonpunk/susfs4ksu
+# (v1.5.5, on GitLab,). This default fetches it from a GitHub mirror whose
+# kernel-4.14 branch tip is the EXACT SAME commit SHA as GitLab upstream
+# (77905b5a...), so its content is identical by construction -- but it needs no
+# gitlab.com access, which is what made this dependency the flaky leg of the
+# build (GitLab throttles Actions runner IPs). Set SUSFS_PATCH_REPO to the
+# GitLab URL to use upstream directly. Pinned by SHA, so the mirror's sync
+# cadence does not affect us; bump deliberately.
+SUSFS_PATCH_REPO="${SUSFS_PATCH_REPO:-https://github.com/Ante0/susfs4ksu}"
+SUSFS_PATCH_REF="${SUSFS_PATCH_REF:-77905b5a071e6f3669e3b1814cea30147c0801da}"  # == upstream kernel-4.14 tip (Feb 23 2025, "Remove support for Shamiko")
 SUSFS_PATCH_DIR="${SUSFS_PATCH_DIR:-/tmp/susfs-patch}"
 
 DEFCONFIG="arch/arm64/configs/vendor/xiaomi/miatoll_defconfig"
@@ -293,7 +297,7 @@ fi
 if ! grep -q 'susfs' fs/Makefile; then
     log "fetching SUSFS 4.14 kernel patch ($SUSFS_PATCH_REF)"
     fetch_pinned "$SUSFS_PATCH_REPO" "$SUSFS_PATCH_REF" "$SUSFS_PATCH_DIR" \
-        || die "cannot fetch SUSFS 4.14 patch (is gitlab.com reachable?)"
+        || die "cannot fetch SUSFS 4.14 patch (GitHub unreachable, or set SUSFS_PATCH_REPO to a gitlab mirror)"
     log "applying SUSFS 4.14 kernel patch"
     patch -p1 --forward < "$SUSFS_PATCH_DIR/kernel_patches/50_add_susfs_in_kernel-4.14.patch" \
         || log "patch reported rejects (expected: 2, re-applied in stages 6 and 6.5)"

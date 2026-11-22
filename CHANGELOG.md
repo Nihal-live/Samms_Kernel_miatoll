@@ -51,9 +51,13 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   (the GitHub `wxx9248/susfs4ksu@kernel-4.9-v2` branch, `71345de`): fetched as an exact SHA
   with `git fetch --depth 1`, not as a floating branch — so the integration is bit-for-bit
   reproducible.
-  The native 4.14 SUSFS patch still comes from upstream GitLab
-  (`simonpunk/susfs4ksu@kernel-4.14`, the only 4.14 variant in existence); that host is a hard
-  dependency of the build.
+  The native 4.14 SUSFS patch now comes from a **GitHub mirror** of the upstream GitLab repo
+  (`Ante0/susfs4ksu`, `kernel-4.14` tip `77905b5a`) — the same commit SHA as upstream GitLab
+  (`simonpunk/susfs4ksu@kernel-4.14`, v1.5.5, Feb 23 2025), so content is identical by
+  construction — pinned by SHA, no gitlab.com access required (previously the build's hard
+  dependency; GitLab throttles Actions runner IPs). Set `SUSFS_PATCH_REPO` to the upstream
+  GitLab URL to override; other mirrors (KairoVera, Trijal08, KateWasHere001) carry the same SHA.
+  The whole SukiSU+SUSFS integration now runs end-to-end locally and in CI from GitHub alone.
 - `.gitignore` now excludes the SukiSU/SUSFS CI-generated files (`KernelSU/`,
   `drivers/kernelsu`, `fs/susfs.c`, `include/linux/susfs*.h`, `*.rej`/`*.orig`).
 - `docs/LICENSE-NOTICE.md`: with the GPL-2.0 tree in-tree, `COPYING` is the primary license for
