@@ -38,6 +38,10 @@ on:
         options:
           - 'true'
           - 'false'
+      susfs_disable:
+        description: Space-separated SUSFS symbols to disable (bisect; empty = full SUSFS)
+        required: false
+        default: ''
   push:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
@@ -88,6 +92,8 @@ jobs:
           ls "$HOME/clang/bin/ld.lld"
 
       - name: Apply SukiSU Nova + SUSFS integration
+        env:
+          SUSFS_DISABLE: ${{ inputs.susfs_disable || '' }}
         run: |
           chmod +x scripts/sukisu-setup.sh
           ./scripts/sukisu-setup.sh
@@ -109,6 +115,7 @@ jobs:
         env:
           TARGET: ${{ inputs.target || 'Image.gz-dtb' }}
           NO_POLLY: ${{ inputs.no_polly || 'true' }}
+          SUSFS_DISABLE: ${{ inputs.susfs_disable || '' }}
         run: |
           EXTRA=()
           if [ "$NO_POLLY" = "true" ]; then EXTRA+=(--no-polly); fi
@@ -118,10 +125,14 @@ jobs:
           echo "--- CONFIG_KSU / SUSFS in generated .config ---"
           grep -E '^CONFIG_(KSU|KALLSYMS|KPROBES)' out/.config || {
             echo "::error::CONFIG_KSU did not survive into .config"; exit 1; }
-          grep -E '^CONFIG_KSU_SUSFS' out/.config || {
-            echo "::error::CONFIG_KSU_SUSFS did not survive into .config"; exit 1; }
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
-            echo "::error::CONFIG_KSU_SUSFS is not =y"; exit 1
+          if [[ " ${SUSFS_DISABLE:-} " != *" CONFIG_KSU_SUSFS "* ]]; then
+            grep -E '^CONFIG_KSU_SUSFS' out/.config || {
+              echo "::error::CONFIG_KSU_SUSFS did not survive into .config"; exit 1; }
+            if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
+              echo "::error::CONFIG_KSU_SUSFS is not =y"; exit 1
+            fi
+          else
+            echo "CONFIG_KSU_SUSFS disabled via susfs_disable input; skipping SUSFS checks"
           fi
 
           echo "--- kernel.release ---"

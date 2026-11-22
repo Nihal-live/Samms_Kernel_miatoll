@@ -26,6 +26,20 @@
 #   in scripts/susfs_414_reconcile.py. Without stage 6 the build fails at the
 #   final link with 7 "undefined symbol: susfs_*" errors.
 #
+# STAGE 10 (RECONCILE): BOOTLOOP FIX
+#   The v2.3.0 core's susfs_spoof_cmdline_or_bootconfig() seq_puts() a NULL
+#   buffer when userspace never programmed a fake /proc/cmdline, and Android
+#   init reads /proc/cmdline during early boot. Pre-fix builds (#5/#6/#7)
+#   panicked before the boot animation. Stage 10 gates both spoof hooks on
+#   their static keys (v1.5.5 semantics) and makes cmdline.c fall through to
+#   saved_command_line.
+#
+# ENV OVERRIDES
+#   SUSFS_DISABLE="CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_MAP"
+#     write the matching defconfig symbols as 'is not set' (Kconfig default is
+#     y). Use for CI bisection, or "CONFIG_KSU_SUSFS" to disable SUSFS
+#     entirely (a Nova-only control build).
+#
 # Usage: ./scripts/sukisu-setup.sh [--check]
 
 set -euo pipefail
@@ -366,61 +380,104 @@ rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej
 find . -name '*.orig' -delete 2>/dev/null || true
 
 # ------------------------------------------------------------- 7. defconfig
+# SUSFS_DISABLE lets CI bisect SUSFS without editing the script: pass a
+# space-separated list of symbols to turn off (e.g.
+#   SUSFS_DISABLE="CONFIG_KSU_SUSFS_SUS_MOUNT"
+# or "CONFIG_KSU_SUSFS" to disable SUSFS entirely). The feature is then
+# written as '# CONFIG_X is not set' because the Kconfig symbols default y.
 python3 - <<'PY'
+import os
 DEFCONFIG = "arch/arm64/configs/vendor/xiaomi/miatoll_defconfig"
-WANT = [
-    "CONFIG_KSU=y",
-    "CONFIG_KSU_FEATURE_ADBROOT=y",
-    "# CONFIG_KSU_DEBUG is not set",
-    "# CONFIG_KPM is not set",
-    "CONFIG_KALLSYMS=y",
-    "CONFIG_KALLSYMS_ALL=y",
-    "CONFIG_KPROBES=y",
-    "",
-    "# --- SUSFS v2.3.0 (kernel-level root hiding) ---",
-    "CONFIG_KSU_SUSFS=y",
-    "CONFIG_KSU_SUSFS_SUS_PATH=y",
-    "CONFIG_KSU_SUSFS_SUS_MOUNT=y",
-    "CONFIG_KSU_SUSFS_SUS_KSTAT=y",
-    "CONFIG_KSU_SUSFS_SPOOF_UNAME=y",
-    "CONFIG_KSU_SUSFS_ENABLE_LOG=y",
-    "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y",
-    "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y",
-    "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y",
-    "CONFIG_KSU_SUSFS_SUS_MAP=y",
-    "# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set",
+SUSFS_FEATURES = [
+    "CONFIG_KSU_SUSFS_SUS_PATH",
+    "CONFIG_KSU_SUSFS_SUS_MOUNT",
+    "CONFIG_KSU_SUSFS_SUS_KSTAT",
+    "CONFIG_KSU_SUSFS_SPOOF_UNAME",
+    "CONFIG_KSU_SUSFS_ENABLE_LOG",
+    "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS",
+    "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG",
+    "CONFIG_KSU_SUSFS_OPEN_REDIRECT",
+    "CONFIG_KSU_SUSFS_SUS_MAP",
 ]
-s = open(DEFCONFIG).read()
-if "CONFIG_KSU_SUSFS=y" in s:
-    print("[sukisu] defconfig already has SUSFS symbols")
+DISABLE = set(os.environ.get("SUSFS_DISABLE", "").split())
+for d in list(DISABLE):
+    if not d.startswith("CONFIG_KSU_SUSFS"):
+        print("[sukisu] WARNING: SUSFS_DISABLE symbol %r is not a KSU_SUSFS symbol, ignoring" % d)
+        DISABLE.discard(d)
+
+lines = open(DEFCONFIG).read().splitlines()
+# Drop any previously appended SUSFS block (idempotent reruns); keep everything
+# else, including the SukiSU Nova block added by the very same script.
+lines = [l for l in lines
+         if l != "# --- SUSFS v2.3.0 (kernel-level root hiding) ---"
+         and not l.startswith("CONFIG_KSU_SUSFS")
+         and not l.startswith("# CONFIG_KSU_SUSFS")]
+text = "\n".join(lines).rstrip("\n") + "\n"
+
+if "CONFIG_KSU=y" not in text:
+    nova = "\n# --- SukiSU Nova (kernel-level root) ---\n" + "\n".join([
+        "CONFIG_KSU=y",
+        "CONFIG_KSU_FEATURE_ADBROOT=y",
+        "# CONFIG_KSU_DEBUG is not set",
+        "# CONFIG_KPM is not set",
+        "CONFIG_KALLSYMS=y",
+        "CONFIG_KALLSYMS_ALL=y",
+        "CONFIG_KPROBES=y",
+    ]) + "\n"
+    text += nova
+    print("[sukisu] Nova defconfig symbols appended")
+
+if "CONFIG_KSU_SUSFS" in DISABLE:
+    block = ["# CONFIG_KSU_SUSFS is not set",
+             "# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set"] + \
+            ["# %s is not set" % f for f in SUSFS_FEATURES]
 else:
-    s = s.replace("# CONFIG_KSU_SUSFS is not set\n", "")
-    if "CONFIG_KSU=y" in s:
-        block = "\n".join(WANT[7:]) + "\n"
-        open(DEFCONFIG, "w").write(s.rstrip("\n") + "\n\n" + block)
-    else:
-        block = "\n# --- SukiSU Nova + SUSFS (kernel-level root) ---\n" + "\n".join(WANT) + "\n"
-        open(DEFCONFIG, "w").write(s.rstrip("\n") + "\n" + block)
-    print("[sukisu] defconfig updated")
+    block = ["CONFIG_KSU_SUSFS=y"]
+    for f in SUSFS_FEATURES:
+        block.append("# %s is not set" % f if f in DISABLE else "%s=y" % f)
+    block.append("# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set")
+text += "\n# --- SUSFS v2.3.0 (kernel-level root hiding) ---\n" + "\n".join(block) + "\n"
+open(DEFCONFIG, "w").write(text)
+print("[sukisu] defconfig SUSFS symbols written (disabled: %s)" %
+      (", ".join(sorted(DISABLE)) or "none"))
 PY
 
 # ---------------------------------------------------------------- 8. verify
+is_disabled() { case " ${SUSFS_DISABLE:-} " in *" $1 "*) return 0;; *) return 1;; esac; }
+# Disabling the master symbol disables every feature with it.
+susfs_disabled() { is_disabled CONFIG_KSU_SUSFS || is_disabled "$1"; }
+
 log "verifying"
-for sym in CONFIG_KSU=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_KPROBES=y \
-           CONFIG_KSU_SUSFS=y CONFIG_KSU_SUSFS_SUS_PATH=y CONFIG_KSU_SUSFS_SUS_MOUNT=y \
+for sym in CONFIG_KSU=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y CONFIG_KPROBES=y; do
+    grep -qx "$sym" "$DEFCONFIG" || die "defconfig missing $sym"
+done
+for sym in CONFIG_KSU_SUSFS=y CONFIG_KSU_SUSFS_SUS_PATH=y CONFIG_KSU_SUSFS_SUS_MOUNT=y \
            CONFIG_KSU_SUSFS_SUS_KSTAT=y CONFIG_KSU_SUSFS_SPOOF_UNAME=y \
            CONFIG_KSU_SUSFS_OPEN_REDIRECT=y CONFIG_KSU_SUSFS_SUS_MAP=y; do
+    if susfs_disabled "${sym%%=*}"; then
+        log "skipping disabled ${sym%%=*}"
+        continue
+    fi
     grep -qx "$sym" "$DEFCONFIG" || die "defconfig missing $sym"
 done
 for f in fs/exec.c fs/open.c kernel/reboot.c kernel/sys.c drivers/input/input.c; do
     grep -q 'ksu_handle' "$f" || die "hook missing in $f"
 done
 grep -q 'susfs_spoof_uname' kernel/sys.c || die "SPOOF_UNAME hook missing in kernel/sys.c (stage 6.5 did not run)"
+if is_disabled CONFIG_KSU_SUSFS; then
+    log "SUSFS disabled via SUSFS_DISABLE; skipping SUSFS source checks"
+    if [[ "${1:-}" == "--check" ]]; then
+        log "check-only mode, done"
+    fi
+    exit 0
+fi
 [[ -f fs/susfs.c ]] || die "fs/susfs.c missing"
 grep -q 'susfs' fs/Makefile || die "fs/Makefile not wired for susfs"
 grep -q 'SUSFS_VERSION' include/linux/susfs.h || die "susfs.h missing version"
 grep -q '4.14 compat layer' fs/susfs.c || die "compat layer missing (stage 6 did not run)"
 grep -q 'fsnotify_iter_info' fs/susfs.c || die "fsnotify signature not fixed"
+grep -q 'static_key_enabled(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)' fs/susfs.c || die "cmdline spoof gate missing (stage 10 BOOTLOOP FIX did not run)"
+grep -q 'static_branch_unlikely' fs/proc/cmdline.c || die "cmdline.c static-key fall-through missing (stage 10 BOOTLOOP FIX did not run)"
 grep -q 'susfs_is_inode_sus_path' fs/readdir.c || die "readdir.c not reconciled"
 ! grep -rq 'INODE_STATE_SUS_PATH' fs/ || die "v1.5.5 i_state guards remain"
 log "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h | cut -d' ' -f3)"

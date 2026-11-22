@@ -58,6 +58,21 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   dependency; GitLab throttles Actions runner IPs). Set `SUSFS_PATCH_REPO` to the upstream
   GitLab URL to override; other mirrors (KairoVera, Trijal08, KateWasHere001) carry the same SHA.
   The whole SukiSU+SUSFS integration now runs end-to-end locally and in CI from GitHub alone.
+- **BOOTLOOP FIX (`scripts/susfs_414_reconcile.py`, stage 10):** the v2.3.0 core's
+  `susfs_spoof_cmdline_or_bootconfig()` blindly `seq_puts()` a `NULL` spoof buffer when userspace
+  never programmed one, and 4.14's `fs/proc/cmdline.c` called it **unconditionally** — Android init
+  reads `/proc/cmdline` during early boot, so the first read page-faulted and the kernel panicked
+  before the boot animation (flash reports: no boot animation, bootloop into splash). Stage 10
+  restores the v1.5.5 contract on the v2.3.0 core: both spoof hooks early-return unless their
+  non-static static keys (`susfs_is_fake_cmdline_or_bootconfig_buffer_set` /
+  `susfs_is_uname_spoof_buffer_set`) are enabled, and `cmdline_proc_show()` now falls through to the
+  stock `saved_command_line` output when the spoof is unset. `kernel/sys.c` SPOOF_UNAME path keeps
+  working (the inner gate now makes the call a no-op until userspace configures it).
+- `scripts/sukisu-setup.sh` gained `SUSFS_DISABLE` (space-separated symbols, e.g.
+  `SUSFS_DISABLE="CONFIG_KSU_SUSFS_SUS_MOUNT"` or `"CONFIG_KSU_SUSFS"` for a Nova-only control
+  build): matching defconfig symbols are written as `# CONFIG_X is not set` (Kconfig default is
+  `y`), the verifier skips them, and the workflow gained a `susfs_disable` dispatch input so the
+  bootloop can be bisected without script edits. Default is unchanged: a full SUSFS build.
 - `.gitignore` now excludes the SukiSU/SUSFS CI-generated files (`KernelSU/`,
   `drivers/kernelsu`, `fs/susfs.c`, `include/linux/susfs*.h`, `*.rej`/`*.orig`).
 - `docs/LICENSE-NOTICE.md`: with the GPL-2.0 tree in-tree, `COPYING` is the primary license for
