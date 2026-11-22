@@ -146,10 +146,26 @@ jobs:
           TARGET: ${{ inputs.target || 'Image.gz-dtb' }}
           NO_POLLY: ${{ inputs.no_polly || 'true' }}
         run: |
+          set -uo pipefail
           EXTRA=()
           if [ "$NO_POLLY" = "true" ]; then EXTRA+=(--no-polly); fi
+
+          LOG="$RUNNER_TEMP/build.log"
           ./scripts/build.sh --clang-dir "$HOME/clang/bin" \
-            --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}"
+            --jobs "$(nproc)" --target "${TARGET:-Image.gz-dtb}" "${EXTRA[@]}" 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            # Job logs are not reachable from every client, but annotations
+            # are. Surface the first real errors as annotations too.
+            echo "::error::build.sh exited $rc"
+            grep -nE "error:|Error [0-9]+$|undefined reference|No rule to make" "$LOG" \
+              | head -8               | while IFS= read -r line; do
+                  echo "::error::${line//%/}"
+                done
+            echo "---- last 40 log lines ----"
+            tail -n 40 "$LOG"
+            exit "$rc"
+          fi
 
           echo "--- CONFIG_KSU in generated .config ---"
           # An option whose Kconfig dependency is unmet is dropped silently by
