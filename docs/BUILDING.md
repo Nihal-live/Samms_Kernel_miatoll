@@ -62,6 +62,20 @@ Defaults: source at the repository root, output `out/`, defconfig
 `KERNEL_DIR`, `OUT_DIR`, `DEFCONFIG`, `TARGET`, `JOBS`, `CLANG_DIR`, `CROSS_COMPILE`,
 `CROSS_COMPILE_COMPAT`, `CLANG_TRIPLE`.
 
+## 3a. Root + hiding variant (SukiSU-Nova + SUSFS)
+
+The clean build above is the default. To build the KernelSU + SUSFS flavour, apply the integration
+to the tree first — `scripts/build.sh` and the rest of the pipeline are unchanged:
+
+```bash
+./scripts/ksu-nova-setup.sh          # applies SukiSU-Nova + SUSFS v2.4.0, edits the defconfig
+./scripts/build.sh --clang-dir "$HOME/clang/bin" --no-polly
+grep -x 'CONFIG_KSU_SUSFS=y' out/.config     # must be =y, not dropped
+```
+
+`--check` re-verifies an already-integrated tree without changing it. The sources, versions and the
+reasons behind them are in [`KSU-SUSFS.md`](KSU-SUSFS.md).
+
 ## 4. Manual equivalent
 
 From the repository root, with the Clang `bin/` directory on `PATH`:

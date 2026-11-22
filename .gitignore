@@ -150,3 +150,16 @@ skynet-*.zip
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- SKYNET KernelSU/SUSFS integration -------------------------------------
+# The untracked SukiSU-Nova clone and the drivers/kernelsu symlink that
+# scripts/ksu-nova-setup.sh creates on every build.
+/KernelSU/
+/drivers/kernelsu
+
+# The kernel's own .gitignore drops *.patch and the whole patches/ directory
+# (Kbuild generates those). The vendored SUSFS patch is a source file here, so
+# it is re-included explicitly.
+!patches/
+!patches/susfs/
+!patches/susfs/*.patch

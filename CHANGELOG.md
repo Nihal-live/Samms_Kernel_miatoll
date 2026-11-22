@@ -42,9 +42,34 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 - `docs/LICENSE-NOTICE.md`: with the GPL-2.0 tree in-tree, `COPYING` is the primary license for
   kernel code and GPL-3.0 `LICENSE` covers SKYNET-authored files.
 
+### Added — KernelSU (SukiSU-Nova) + SUSFS variant
+
+- [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh): applies **SukiSU-Nova** (`builtin`,
+  pinned commit `4bec532dd`) + **SUSFS v2.4.0** to a clean checkout — ref validation, `drivers/`
+  wiring, the four 4.14 hook call sites, the SUSFS patch and Kconfig-derived defconfig symbols.
+  Idempotent, and `--check` re-verifies an integrated tree without changing it.
+- [`patches/susfs/susfs-4.14-v2.4.0.patch`](patches/susfs/): the SUSFS v2.4.0 kernel side rebased
+  onto this tree, applying with zero fuzz. Derived from simonpunk's susfs4ksu (GPL-2.0); see
+  [`patches/susfs/README.md`](patches/susfs/README.md) for provenance.
+- [`.github/workflows/build-kernel-sukisu.yml`](.github/workflows/build-kernel-sukisu.yml): builds
+  the root/hiding flavour and asserts that every requested `CONFIG_KSU_SUSFS_*` survived
+  `olddefconfig` into `.config`.
+- [`docs/KSU-SUSFS.md`](docs/KSU-SUSFS.md): version rationale, the traps inherited from
+  KernelSU_Action_V2 (silent ref fallback, silently dropped Kconfig symbols, toolchain traps),
+  and the two hooks that are deliberately **not** patched on 4.14.
+- `Validate` gained a dry-run job that applies the whole integration to a clean tree, so upstream
+  drift fails in a minute instead of after a 40-minute build.
+
+### Removed
+
+- `scripts/sukisu-setup.sh` and `scripts/susfs_414_reconcile.py`: the previous approach paired the
+  v1.5.5 4.14 SUSFS patch with the v2.3.0 core and bridged the API gap with a Python rewriter. It
+  is replaced by a single v2.4.0 patch that applies cleanly, which removes the rewriter entirely.
+
 ### Notes
 
-- The `17` line stays **clean / stock-like**: no KernelSU, SUSFS or other root/hiding patches.
+- The committed defconfig stays **clean / stock-like** — no `CONFIG_KSU`, no root or hiding
+  integrations. The SukiSU-Nova + SUSFS flavour is opt-in and applies its config at build time.
 - No flashable ZIP is committed to the repository; none has been validated on hardware yet.
 
 ### First CI build — `skynet-17-r1` (UNTESTED, **SUPERSEDED**)

@@ -1,18 +1,35 @@
-name: Build SKYNET kernel + SukiSU Nova + SUSFS (AnyKernel3 ZIP)
+name: Build SKYNET kernel + SukiSU-Nova + SUSFS (AnyKernel3 ZIP)
 
-# Builds the miatoll/excalibur 4.14.357 kernel with SukiSU Nova embedded at
-# kernel level AND SUSFS v2.3.0 root-hiding, then packages a flashable
+# Builds the miatoll 4.14.357 kernel with SukiSU-Nova (`builtin`) embedded at
+# kernel level and SUSFS v2.4.0 root hiding, then packages a flashable
 # AnyKernel3 ZIP.
 #
-# The whole integration is applied by scripts/sukisu-setup.sh on every run, so
-# the build is reproducible from a clean checkout -- nothing depends on a local
-# working tree. Only two files need to be committed:
-#   scripts/sukisu-setup.sh
-#   .github/workflows/build-kernel-sukisu.yml
+# The whole integration is applied from a clean checkout by
+# scripts/ksu-nova-setup.sh on every run, so nothing depends on a local working
+# tree and the result is reproducible:
+#
+#   input (committed)                          applied at build time
+#   --------------------------------------     -------------------------------
+#   patches/susfs/susfs-4.14-v2.4.0.patch   -> fs/susfs.c, include/linux/susfs*.h,
+#                                               fs/, mm/, security/ hook hunks
+#   scripts/ksu-nova-setup.sh               -> SukiSU-Nova @ pinned commit,
+#                                               drivers/kernelsu, KSU hooks,
+#                                               defconfig symbols
+#
+# See docs/KSU-SUSFS.md for why those exact sources, and what is deliberately
+# *not* wired (the legacy faccessat/stat su hooks, for instance).
+#
+# The build is untested on hardware: the job proves it compiles and that
+# CONFIG_KSU / CONFIG_KSU_SUSFS actually survived into .config -- not that the
+# resulting kernel boots on your device.
 
 on:
   workflow_dispatch:
     inputs:
+      ksu_ref:
+        description: 'SukiSU-Nova ref (empty = pinned commit in scripts/ksu-nova-setup.sh)'
+        required: false
+        default: ''
       clang_repo:
         description: Prebuilt Clang/LLD repository
         required: true
@@ -40,9 +57,10 @@ on:
   push:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
-      - 'scripts/sukisu-setup.sh'
+      - 'scripts/ksu-nova-setup.sh'
       - 'scripts/build.sh'
       - 'scripts/package-anykernel.sh'
+      - 'patches/susfs/**'
       - 'arch/arm64/configs/vendor/xiaomi/miatoll_defconfig'
       - 'anykernel3/**'
     tags:
@@ -82,23 +100,45 @@ jobs:
           CLANG_REF: ${{ inputs.clang_ref || 'master' }}
         run: |
           git clone --depth 1 -b "$CLANG_REF" "$CLANG_REPO" "$HOME/clang"
+          # A wrong repo/ref does not 404 here -- AOSP-style prebuilt
+          # repositories happily serve empty version directories -- so verify
+          # the tools exist instead of finding out 40 minutes later.
           "$HOME/clang/bin/clang" --version | head -n1
-          ls "$HOME/clang/bin/ld.lld"
+          for tool in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip; do
+            test -x "$HOME/clang/bin/$tool" \
+              || { echo "::error::missing toolchain binary $tool"; exit 1; }
+          done
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Apply SukiSU Nova + SUSFS integration
+      - name: Apply SukiSU-Nova + SUSFS integration
+        env:
+          KSU_REF: ${{ inputs.ksu_ref }}
         run: |
-          chmod +x scripts/sukisu-setup.sh
-          ./scripts/sukisu-setup.sh
+          chmod +x scripts/ksu-nova-setup.sh
+          ./scripts/ksu-nova-setup.sh
+          {
+            echo "### SukiSU-Nova + SUSFS"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| SukiSU-Nova | \`$(git -C KernelSU rev-parse HEAD)\` |"
+            echo "| SUSFS | \`$(sed -nE 's/.*SUSFS_VERSION[[:space:]]+"([^"]+)".*/\1/p' include/linux/susfs.h | head -n1)\` |"
+            echo "| defconfig | \`$(grep -cE '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig) SUSFS options\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inspect applied tree
+        run: |
           echo "--- KSU wiring ---"
           ls -l drivers/kernelsu
           tail -2 drivers/Makefile
           grep -n 'kernelsu' drivers/Kconfig
           echo "--- KSU hooks ---"
-          grep -c 'ksu_handle' fs/exec.c fs/open.c kernel/reboot.c kernel/sys.c drivers/input/input.c
+          grep -c 'ksu_handle' fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c
           echo "--- SUSFS wiring ---"
           grep -n 'susfs' fs/Makefile
           grep -E '^#define SUSFS_VERSION' include/linux/susfs.h
-          grep -c 'SUSFS_414_COMPAT' include/linux/susfs_def.h
+          echo "--- defconfig ---"
+          grep -E '^CONFIG_KSU' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 
       - name: Verify in-tree source
         run: ./scripts/verify-source.sh
@@ -114,13 +154,22 @@ jobs:
             --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}"
 
           echo "--- CONFIG_KSU / SUSFS in generated .config ---"
-          grep -E '^CONFIG_(KSU|KALLSYMS|KPROBES)' out/.config || {
+          # An option whose Kconfig dependency is unmet is dropped silently by
+          # olddefconfig, which is exactly how you end up shipping a kernel
+          # that looks patched and hides nothing. Assert every symbol the
+          # defconfig asks for actually made it.
+          grep -E '^CONFIG_(KSU|KALLSYMS)' out/.config || {
             echo "::error::CONFIG_KSU did not survive into .config"; exit 1; }
-          grep -E '^CONFIG_KSU_SUSFS' out/.config || {
-            echo "::error::CONFIG_KSU_SUSFS did not survive into .config"; exit 1; }
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
-            echo "::error::CONFIG_KSU_SUSFS is not =y"; exit 1
-          fi
+          for sym in CONFIG_KSU CONFIG_KSU_SUSFS; do
+            grep -qx "$sym=y" out/.config || {
+              echo "::error::$sym is not =y in .config"; exit 1; }
+          done
+          while read -r sym; do
+            grep -qx "$sym" out/.config || {
+              echo "::error::defconfig symbol $sym was dropped from .config"; exit 1; }
+          done < <(grep -E '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' \
+                     arch/arm64/configs/vendor/xiaomi/miatoll_defconfig)
+          echo "all $(grep -cE '^CONFIG_KSU_SUSFS[A-Z_0-9]*=y$' out/.config) SUSFS options survived"
 
           echo "--- kernel.release ---"
           REL="$(cat out/include/config/kernel.release 2>/dev/null || printf 'unknown')"
@@ -135,7 +184,7 @@ jobs:
       - name: Package AnyKernel3 ZIP
         id: package
         run: |
-          NAME="skynet-17-sukisu-susfs-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          NAME="skynet-17-sukisu-nova-susfs-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           ./scripts/package-anykernel.sh --name "$NAME" \
             --out "$GITHUB_WORKSPACE/$NAME.zip"
           sha256sum "$NAME.zip" | tee "$NAME.zip.sha256"
@@ -143,7 +192,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: skynet-kernel-sukisu-susfs-zip
+          name: skynet-kernel-sukisu-nova-susfs-zip
           path: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256
@@ -158,20 +207,26 @@ jobs:
           body: |
             ## UNTESTED — hardware validation required
 
-            Kernel with **SukiSU Nova** embedded at kernel level and **SUSFS
-            v2.3.0** root-hiding, built by `Build SKYNET kernel + SukiSU Nova +
-            SUSFS`.
+            Kernel with **SukiSU-Nova** (`builtin`, source-integrated) and
+            **SUSFS v2.4.0** root hiding, built by
+            `Build SKYNET kernel + SukiSU-Nova + SUSFS`.
+
+            | item | value |
+            | --- | --- |
+            | SukiSU-Nova | committed in `scripts/ksu-nova-setup.sh` (`KSU_REF`) |
+            | SUSFS | v2.4.0 (`patches/susfs/susfs-4.14-v2.4.0.patch`) |
+            | source | `${{ github.sha }}` on `${{ github.ref_name }}` |
 
             **Not boot-tested on any miatoll device.** Back up `boot`, `dtbo`,
             `vendor_boot`, `recovery` and `persist` before flashing, verify the
             device codename and slot layout, and check the attached `.sha256`.
 
-            Install the **SukiSU Nova** manager (`com.sukisu.nova`) — an older
-            SukiSU Ultra manager will report "kernel update required".
+            Install the **SukiSU-Nova** manager — an older SukiSU Ultra manager
+            will report "kernel update required".
 
-            SUSFS needs a matching userspace module. Use a `ksu_susfs` build
-            that speaks the **v2.3.0** protocol; a v1.5.x module will report
-            the kernel as unsupported.
+            SUSFS needs a matching userspace module: use a `ksu_susfs` build
+            that speaks the **v2.4.0** protocol. A v1.5.x module reports the
+            kernel as unsupported.
           files: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256
