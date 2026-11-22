@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# sukisu-setup.sh -- reproducible SukiSU Nova + SUSFS integration for the
-# miatoll/excalibur 4.14.357 tree. Run BEFORE building; the CI workflow calls
-# it automatically, so a clean checkout always produces the same kernel.
+# sukisu-setup.sh -- reproducible SukiSU Nova + SUSFS v2.3.0 integration for
+# the miatoll/excalibur 4.14.357 tree. Run BEFORE building; the CI workflow
+# calls it automatically, so a clean checkout always produces the same kernel.
 #
 # Stages (all idempotent):
 #   1. clone SukiSU-Nova (builtin) and wire drivers/Makefile + drivers/Kconfig
 #   2. apply the two 4.14 compatibility fixes to the SukiSU source
 #   3. apply the manual KernelSU hook call sites
-#   4. install SUSFS v2.3.0 core files (fs/susfs.c + headers)
-#   5. apply the SUSFS 4.14 kernel patch, hand-fixing the two known rejects
-#   6. apply the 4.14 backport shim + fsnotify signature fixes
+#   4. install the SUSFS v2.3.0 core (fs/susfs.c + headers)
+#   5. apply the native SUSFS 4.14 kernel patch (the fs/ hook hunks)
+#   6. RECONCILE the v1.5.5 patch against the v2.3.0 core  <-- the fix
 #   7. set the defconfig symbols
 #   8. verify
+#
+# WHY STAGE 6 EXISTS
+#   No single SUSFS branch has both halves we need:
+#     * kernel-4.14 (upstream) is frozen at v1.5.5 -- its API does not match
+#       what SukiSU Nova calls (11 of 15 symbols missing).
+#     * kernel-4.9-v2 (wxx9248) is v2.3.0 -- the API SukiSU Nova expects, but
+#       its patch is written for 4.9 and rejects 41 times on 4.14.
+#   So we take the v2.3.0 CORE + the native 4.14 PATCH, and bridge the API gap
+#   in scripts/susfs_414_reconcile.py. Without stage 6 the build fails at the
+#   final link with 7 "undefined symbol: susfs_*" errors.
 #
 # Usage: ./scripts/sukisu-setup.sh [--check]
 
@@ -28,8 +38,7 @@ SETUP_URL="${SETUP_URL:-https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nov
 
 # SUSFS needs TWO sources, because no single branch has both halves:
 #   * the v2.3.0 CORE (fs/susfs.c + headers) -- the only API generation that
-#     matches what SukiSU Nova calls. The upstream kernel-4.14 branch is stale
-#     at v1.5.5 and is NOT compatible (11 of 15 symbols missing).
+#     matches what SukiSU Nova calls.
 #   * the native 4.14 KERNEL PATCH (the fs/ hook hunks) -- only upstream ships
 #     a 4.14 variant; the v2.3.0 branch only has a 4.9 patch.
 SUSFS_CORE_REPO="${SUSFS_CORE_REPO:-https://github.com/wxx9248/susfs4ksu}"
@@ -46,6 +55,9 @@ log() { printf '[sukisu] %s\n' "$*"; }
 die() { printf '[sukisu] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1. upstream
+# KernelSU/ is an untracked clone; drivers/kernelsu is an untracked symlink.
+# A partial state (clone present, symlink gone) is possible after a cleanup,
+# so re-create the symlink whenever the clone exists.
 if [[ ! -d KernelSU/kernel ]]; then
     log "cloning SukiSU-Nova ($KSU_REF)"
     curl -LSs "$SETUP_URL" -o /tmp/ksu-setup.sh || die "cannot fetch setup.sh"
@@ -54,7 +66,24 @@ else
     log "KernelSU/ already present, skipping clone"
 fi
 
+if [[ ! -e drivers/kernelsu && -d KernelSU/kernel ]]; then
+    log "re-creating drivers/kernelsu symlink"
+    ln -sfn ../KernelSU/kernel drivers/kernelsu
+fi
+
 [[ -L drivers/kernelsu || -d drivers/kernelsu ]] || die "drivers/kernelsu symlink missing"
+
+# The wiring lives in tracked files, so a `git checkout` can undo it while the
+# untracked clone survives. Re-apply it whenever it is missing.
+if ! grep -q 'kernelsu' drivers/Makefile; then
+    log "wiring drivers/Makefile"
+    printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+fi
+if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+    log "wiring drivers/Kconfig"
+    printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+fi
+
 grep -q 'kernelsu' drivers/Makefile || die "drivers/Makefile not wired"
 grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || die "drivers/Kconfig not wired"
 log "upstream wiring OK"
@@ -220,7 +249,7 @@ else
 fi
 
 # --------------------------------------------- 5. SUSFS 4.14 kernel patch
-# The native 4.14 patch applies with only two rejects, which we fix below.
+# The native 4.14 patch applies with only two rejects, which stage 6 fixes.
 if ! grep -q 'susfs' fs/Makefile; then
     log "fetching SUSFS 4.14 kernel patch ($SUSFS_PATCH_REF)"
     rm -rf "$SUSFS_PATCH_DIR"
@@ -228,149 +257,26 @@ if ! grep -q 'susfs' fs/Makefile; then
         || die "cannot clone SUSFS 4.14 patch"
     log "applying SUSFS 4.14 kernel patch"
     patch -p1 --forward < "$SUSFS_PATCH_DIR/kernel_patches/50_add_susfs_in_kernel-4.14.patch" \
-        || log "patch reported rejects (expected: 2, fixed below)"
+        || log "patch reported rejects (expected: 2, fixed in stage 6)"
 else
     log "SUSFS kernel patch already applied"
 fi
 
-# --- reject 1: fs/proc/task_mmu.c include ---
-python3 - <<'PY'
-p = "fs/proc/task_mmu.c"
-s = open(p).read()
-if "susfs_def.h" in s:
-    print("[sukisu] task_mmu include already present")
-else:
-    old = "#include <linux/mm_inline.h>\n"
-    new = ("#include <linux/mm_inline.h>\n"
-           "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
-           "#include <linux/susfs_def.h>\n"
-           "#endif\n")
-    if old not in s:
-        raise SystemExit("[sukisu] ERROR: task_mmu anchor missing")
-    open(p, "w").write(s.replace(old, new, 1))
-    print("[sukisu] task_mmu include added")
-PY
-
-# --- reject 2: kernel/sys.c newuname spoof ---
-python3 - <<'PY'
-p = "kernel/sys.c"
-s = open(p).read()
-if "susfs_spoof_uname" in s:
-    print("[sukisu] newuname hook already present")
-else:
-    old = ("SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n"
-           "{\n"
-           "\tstruct new_utsname tmp;\n"
-           "\n"
-           "\tdown_read(&uts_sem);\n"
-           "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n")
-    new = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-           "extern void susfs_spoof_uname(struct new_utsname *tmp);\n"
-           "#endif\n"
-           "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n"
-           "{\n"
-           "\tstruct new_utsname tmp;\n"
-           "\n"
-           "\tdown_read(&uts_sem);\n"
-           "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n"
-           "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
-           "\tsusfs_spoof_uname(&tmp);\n"
-           "#endif\n")
-    if old not in s:
-        raise SystemExit("[sukisu] ERROR: newuname anchor missing")
-    open(p, "w").write(s.replace(old, new, 1))
-    print("[sukisu] newuname hook added")
-PY
+# ------------------------------------- 6. RECONCILE v1.5.5 patch <-> v2.3.0 core
+# This is the stage that makes the build link. It:
+#   * adds compat wrappers for the v1.5.5-named functions the patch calls
+#   * rewrites fs/readdir.c to the v2.3.0 ilookup()/inode-flag style
+#   * moves i_state bit tests to i_mapping->flags (v2.3.0 scheme)
+#   * replaces current->susfs_task_state tests with the v2.3.0 helper
+#   * fixes the fsnotify handle_event / fsnotify_add_mark 4.14 signatures
+#   * adds the missing declarations and includes
+RECONCILE="scripts/susfs_414_reconcile.py"
+[[ -f "$RECONCILE" ]] || die "$RECONCILE missing (must be committed to the repo)"
+log "reconciling v1.5.5 patch with v2.3.0 core"
+python3 "$RECONCILE" || die "reconcile failed"
 
 rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej
 find . -name '*.orig' -delete 2>/dev/null || true
-
-# ------------------------------- 6. 4.14 backport shim + fsnotify signatures
-python3 - <<'PY'
-p = "include/linux/susfs_def.h"
-s = open(p).read()
-
-# (a) the 4.14 patch hunks use v1.5.5 macro names; map them onto v2.3.0.
-if "SUSFS_414_COMPAT" not in s:
-    shim = """
-/* ===== 4.14 backport shim: v1.5.5 macro names used by the 4.14 patch hunks,
- * mapped onto the v2.3.0 AS_FLAGS_* / TIF_* scheme. ===== */
-#define SUSFS_414_COMPAT 1
-#ifndef DEFAULT_SUS_MNT_ID
-#define DEFAULT_SUS_MNT_ID 100000
-#endif
-#ifndef DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE
-#define DEFAULT_SUS_MNT_ID_FOR_KSU_PROC_UNSHARE 1000000
-#endif
-#ifndef DEFAULT_SUS_MNT_GROUP_ID
-#define DEFAULT_SUS_MNT_GROUP_ID 1000
-#endif
-#ifndef INODE_STATE_SUS_PATH
-#define INODE_STATE_SUS_PATH AS_FLAGS_SUS_PATH
-#endif
-#ifndef INODE_STATE_SUS_MOUNT
-#define INODE_STATE_SUS_MOUNT AS_FLAGS_SUS_MOUNT
-#endif
-#ifndef INODE_STATE_SUS_KSTAT
-#define INODE_STATE_SUS_KSTAT AS_FLAGS_SUS_KSTAT
-#endif
-#ifndef INODE_STATE_OPEN_REDIRECT
-#define INODE_STATE_OPEN_REDIRECT AS_FLAGS_OPEN_REDIRECT
-#endif
-#ifndef TASK_STRUCT_NON_ROOT_USER_APP_PROC
-#define TASK_STRUCT_NON_ROOT_USER_APP_PROC TIF_PROC_UMOUNTED
-#endif
-"""
-    s = s.replace("#endif // #ifndef KSU_SUSFS_DEF_H",
-                  shim + "\n#endif // #ifndef KSU_SUSFS_DEF_H")
-    print("[sukisu] 4.14 macro shim added")
-else:
-    print("[sukisu] 4.14 macro shim already present")
-
-# (b) current_uid()/sched.h are needed by the inline helpers.
-if "#include <linux/cred.h>" not in s:
-    old = "#include <linux/bits.h>\n#include <linux/string.h>\n"
-    new = ("#include <linux/bits.h>\n#include <linux/string.h>\n"
-           "#include <linux/cred.h>\n#include <linux/sched.h>\n")
-    if old in s:
-        s = s.replace(old, new, 1)
-        print("[sukisu] cred/sched includes added")
-    else:
-        print("[sukisu] WARN: include anchor missing")
-open(p, "w").write(s)
-PY
-
-# (c) fsnotify changed between 4.9 and 4.14: handle_event gained
-#     `const void *data` + `iter_info`, and fsnotify_add_mark lost the group arg.
-python3 - <<'PY'
-p = "fs/susfs.c"
-s = open(p).read()
-changed = False
-
-old_a = ("\tu32 mask, void *data, int data_type,\n"
-         "\tconst unsigned char *file_name, u32 cookie)\n{\n")
-new_a = ("\tu32 mask, const void *data, int data_type,\n"
-         "\tconst unsigned char *file_name, u32 cookie,\n"
-         "\tstruct fsnotify_iter_info *iter_info)\n{\n")
-if old_a in s:
-    s = s.replace(old_a, new_a, 1); changed = True
-    print("[sukisu] fsnotify handle_event signature fixed")
-
-old_b = ("\tfsnotify_init_mark(m, NULL);\n"
-         "\tm->mask = mask;\n"
-         "\tif (fsnotify_add_mark(m, g, inode, NULL, 0)) {\n")
-new_b = ("\tfsnotify_init_mark(m, g);\n"
-         "\tm->mask = mask;\n"
-         "\tif (fsnotify_add_mark(m, inode, NULL, 0)) {\n")
-if old_b in s:
-    s = s.replace(old_b, new_b, 1); changed = True
-    print("[sukisu] fsnotify_add_mark signature fixed")
-
-if changed:
-    open(p, "w").write(s)
-else:
-    print("[sukisu] fsnotify signatures already fixed")
-PY
 
 # ------------------------------------------------------------- 7. defconfig
 python3 - <<'PY'
@@ -401,7 +307,6 @@ s = open(DEFCONFIG).read()
 if "CONFIG_KSU_SUSFS=y" in s:
     print("[sukisu] defconfig already has SUSFS symbols")
 else:
-    # drop the old "not set" line if the KSU block is already there
     s = s.replace("# CONFIG_KSU_SUSFS is not set\n", "")
     if "CONFIG_KSU=y" in s:
         block = "\n".join(WANT[7:]) + "\n"
@@ -426,8 +331,10 @@ done
 [[ -f fs/susfs.c ]] || die "fs/susfs.c missing"
 grep -q 'susfs' fs/Makefile || die "fs/Makefile not wired for susfs"
 grep -q 'SUSFS_VERSION' include/linux/susfs.h || die "susfs.h missing version"
-grep -q 'SUSFS_414_COMPAT' include/linux/susfs_def.h || die "4.14 shim missing"
+grep -q '4.14 compat layer' fs/susfs.c || die "compat layer missing (stage 6 did not run)"
 grep -q 'fsnotify_iter_info' fs/susfs.c || die "fsnotify signature not fixed"
+grep -q 'susfs_is_inode_sus_path' fs/readdir.c || die "readdir.c not reconciled"
+! grep -rq 'INODE_STATE_SUS_PATH' fs/ || die "v1.5.5 i_state guards remain"
 log "SUSFS version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h | cut -d' ' -f3)"
 log "all checks passed"
 
