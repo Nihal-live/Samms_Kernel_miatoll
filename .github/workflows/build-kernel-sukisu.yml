@@ -128,8 +128,10 @@ jobs:
         run: |
           EXTRA=()
           if [ "$NO_POLLY" = "true" ]; then EXTRA+=(--no-polly); fi
+          set -o pipefail
           ./scripts/build.sh --clang-dir "$HOME/clang/bin" \
-            --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}"
+            --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-${GITHUB_RUN_NUMBER}.log"
 
           echo "--- CONFIG_KSU / SUSFS in generated .config ---"
           grep -E '^CONFIG_(KSU|KALLSYMS|KPROBES)' out/.config || {
@@ -153,6 +155,14 @@ jobs:
           esac
           echo "--- boot artefacts ---"
           ls -lh out/arch/arm64/boot/ || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log-${{ github.run_number }}
+          path: build-${{ github.run_number }}.log
+          if-no-files-found: ignore
 
       - name: Package AnyKernel3 ZIP
         id: package
