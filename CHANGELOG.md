@@ -59,6 +59,20 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   drift, a hook landing in the wrong function, or a non-idempotent re-run fails in a minute instead
   of after a 40-minute build.
 
+#### First green build (UNTESTED)
+
+- Run [`45057289070`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45057289070),
+  commit `238b5757a`, proton-clang `master`, `--no-polly`, 15m29s.
+- Artifact `skynet-kernel-sukisu-nova-zip` (38.1 MB) — an AnyKernel3 ZIP plus `.sha256`.
+- Passing assertions from that run: `CONFIG_KSU=y` and `CONFIG_KSU_FEATURE_ADBROOT=y` survived
+  `olddefconfig` in `out/.config`, `CONFIG_KPM` stayed off, no `CONFIG_KSU_SUSFS*` symbol leaked
+  in, `kernel.release` contains `SKYNET`, and every `ksu_handle_*` a hooked file calls is defined
+  in the SukiSU-Nova clone.
+- **Not boot-tested.** This proves the kernel compiles and links with root integrated, nothing
+  more. The previous attempt died at `ld.lld: undefined symbol: ksu_handle_setresuid`, which is
+  the failure the symbol gate in the setup script now rules out.
+
+
 ### Removed
 
 - **SUSFS** from this build: `patches/susfs/` (the vendored v2.4.0 4.14 patch) and
