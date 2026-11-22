@@ -6,12 +6,13 @@
 # calls it automatically, so a clean checkout always produces the same kernel.
 #
 # Stages (all idempotent):
-#   1. clone SukiSU-Nova (builtin) and wire drivers/Makefile + drivers/Kconfig
+#   1. clone SukiSU-Nova (builtin, SHA-pinned) and wire drivers/Makefile + drivers/Kconfig
 #   2. apply the two 4.14 compatibility fixes to the SukiSU source
 #   3. apply the manual KernelSU hook call sites
-#   4. install the SUSFS v2.3.0 core (fs/susfs.c + headers)
+#   4. install the SUSFS v2.3.0 core (fs/susfs.c + headers, SHA-pinned)
 #   5. apply the native SUSFS 4.14 kernel patch (the fs/ hook hunks)
 #   6. RECONCILE the v1.5.5 patch against the v2.3.0 core  <-- the fix
+#   6.5 re-install the SPOOF_UNAME hook in kernel/sys.c (patch hunk rejects there)
 #   7. set the defconfig symbols
 #   8. verify
 #
@@ -32,9 +33,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Pinned to the exact commits the verified SUSFS CI build was produced from, so
+# a clean checkout is reproducible bit-for-bit. Override via the environment to
+# upgrade deliberately (bump both the ref AND re-run the SUSFS CI build).
 KSU_REPO="${KSU_REPO:-https://github.com/SukiSU-Nova/SukiSU-Nova}"
-KSU_REF="${KSU_REF:-builtin}"
-SETUP_URL="${SETUP_URL:-https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/builtin/kernel/setup.sh}"
+KSU_REF="${KSU_REF:-4bec532dd447e2852aa8932afa768255350c103a}"  # SukiSU-Nova builtin HEAD the verified SUSFS CI build used
 
 # SUSFS needs TWO sources, because no single branch has both halves:
 #   * the v2.3.0 CORE (fs/susfs.c + headers) -- the only API generation that
@@ -42,10 +45,14 @@ SETUP_URL="${SETUP_URL:-https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nov
 #   * the native 4.14 KERNEL PATCH (the fs/ hook hunks) -- only upstream ships
 #     a 4.14 variant; the v2.3.0 branch only has a 4.9 patch.
 SUSFS_CORE_REPO="${SUSFS_CORE_REPO:-https://github.com/wxx9248/susfs4ksu}"
-SUSFS_CORE_REF="${SUSFS_CORE_REF:-kernel-4.9-v2}"
+SUSFS_CORE_REF="${SUSFS_CORE_REF:-71345ded5af28f55d76ebcdc7a9df9cea56111e1}"  # kernel-4.9-v2 HEAD (v2.3.0 port)
 SUSFS_CORE_DIR="${SUSFS_CORE_DIR:-/tmp/susfs-core}"
 
 SUSFS_PATCH_REPO="${SUSFS_PATCH_REPO:-https://gitlab.com/simonpunk/susfs4ksu}"
+# The ONLY native 4.14 SUSFS patch lives on GitLab upstream (v1.5.5-era); there
+# is no GitHub mirror. It tracks a moving branch, so the build cannot succeed
+# while gitlab.com is unreachable. To freeze a known-good revision add a full
+# 40-char SHA to SUSFS_PATCH_REF (fetch_pinned handles SHAs).
 SUSFS_PATCH_REF="${SUSFS_PATCH_REF:-kernel-4.14}"
 SUSFS_PATCH_DIR="${SUSFS_PATCH_DIR:-/tmp/susfs-patch}"
 
@@ -54,21 +61,51 @@ DEFCONFIG="arch/arm64/configs/vendor/xiaomi/miatoll_defconfig"
 log() { printf '[sukisu] %s\n' "$*"; }
 die() { printf '[sukisu] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# fetch_pinned URL REF DEST -- REF may be a branch/tag name or a full 40-char
+# commit SHA. A 40-char SHA is fetched directly (GitHub allows reachable-SHA
+# fetch; git clone -b cannot check out a raw SHA), giving a bit-for-bit
+# reproducible tree. Any other REF is cloned with -b as usual.
+fetch_pinned() {
+    local url="$1" ref="$2" dest="$3"
+    rm -rf "$dest"
+    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+        mkdir -p "$dest"
+        git -C "$dest" init -q
+        git -C "$dest" remote add origin "$url"
+        git -C "$dest" fetch --depth 1 origin "$ref" || return 1
+        git -C "$dest" checkout -q --detach FETCH_HEAD
+    else
+        git clone --depth 1 -b "$ref" "$url" "$dest" || return 1
+    fi
+}
+
 # ---------------------------------------------------------------- 1. upstream
 # KernelSU/ is an untracked clone; drivers/kernelsu is an untracked symlink.
 # A partial state (clone present, symlink gone) is possible after a cleanup,
-# so re-create the symlink whenever the clone exists.
-if [[ ! -d KernelSU/kernel ]]; then
+# so re-create the symlink whenever the clone exists. The clone is done with
+# git only (no raw.githubusercontent.com/setup.sh dependency).
+if [[ ! -e KernelSU/kernel ]]; then
     log "cloning SukiSU-Nova ($KSU_REF)"
-    curl -LSs "$SETUP_URL" -o /tmp/ksu-setup.sh || die "cannot fetch setup.sh"
-    sh /tmp/ksu-setup.sh "$KSU_REF" || die "setup.sh failed"
+    fetch_pinned "$KSU_REPO" "$KSU_REF" "KernelSU" || die "cannot fetch SukiSU-Nova"
 else
     log "KernelSU/ already present, skipping clone"
 fi
 
-if [[ ! -e drivers/kernelsu && -d KernelSU/kernel ]]; then
-    log "re-creating drivers/kernelsu symlink"
+if [[ ! -e drivers/kernelsu ]]; then
+    log "creating drivers/kernelsu symlink"
     ln -sfn ../KernelSU/kernel drivers/kernelsu
+fi
+
+# Enforce the pin: a pre-existing KernelSU/ clone is not silently reused when
+# it does not match the pinned ref (this is how a stale local tree would leak
+# into an otherwise reproducible build).
+if [[ "$KSU_REF" =~ ^[0-9a-f]{40}$ ]]; then
+    [[ -d KernelSU/.git ]] || die "KernelSU/ is missing or not a git checkout"
+    cur="$(git -C KernelSU rev-parse HEAD)"
+    if [[ "$cur" != "$KSU_REF" ]]; then
+        die "KernelSU/ is at $cur but the pin wants $KSU_REF -- remove KernelSU/ and re-run"
+    fi
+    log "KernelSU pinned at $cur"
 fi
 
 [[ -L drivers/kernelsu || -d drivers/kernelsu ]] || die "drivers/kernelsu symlink missing"
@@ -237,9 +274,8 @@ PY
 # ------------------------------------------------------- 4. SUSFS core files
 if [[ ! -f fs/susfs.c ]]; then
     log "fetching SUSFS v2.3.0 core ($SUSFS_CORE_REF)"
-    rm -rf "$SUSFS_CORE_DIR"
-    git clone --depth 1 -b "$SUSFS_CORE_REF" "$SUSFS_CORE_REPO" "$SUSFS_CORE_DIR" \
-        || die "cannot clone SUSFS core"
+    fetch_pinned "$SUSFS_CORE_REPO" "$SUSFS_CORE_REF" "$SUSFS_CORE_DIR" \
+        || die "cannot fetch SUSFS core"
     cp "$SUSFS_CORE_DIR/kernel_patches/fs/susfs.c"                 fs/susfs.c
     cp "$SUSFS_CORE_DIR/kernel_patches/include/linux/susfs.h"     include/linux/susfs.h
     cp "$SUSFS_CORE_DIR/kernel_patches/include/linux/susfs_def.h" include/linux/susfs_def.h
@@ -249,15 +285,18 @@ else
 fi
 
 # --------------------------------------------- 5. SUSFS 4.14 kernel patch
-# The native 4.14 patch applies with only two rejects, which stage 6 fixes.
+# The native 4.14 patch leaves exactly two hunks rejected on this tree, both
+# because the tree carries Xiaomi/openela FAKE_UNAME bpfloader code:
+#   * fs/proc/task_mmu.c (include hunk) -- re-applied by stage 6
+#     (susfs_414_reconcile.py).
+#   * kernel/sys.c (SPOOF_UNAME in newuname)   -- re-applied by stage 6.5 here.
 if ! grep -q 'susfs' fs/Makefile; then
     log "fetching SUSFS 4.14 kernel patch ($SUSFS_PATCH_REF)"
-    rm -rf "$SUSFS_PATCH_DIR"
-    git clone --depth 1 -b "$SUSFS_PATCH_REF" "$SUSFS_PATCH_REPO" "$SUSFS_PATCH_DIR" \
-        || die "cannot clone SUSFS 4.14 patch"
+    fetch_pinned "$SUSFS_PATCH_REPO" "$SUSFS_PATCH_REF" "$SUSFS_PATCH_DIR" \
+        || die "cannot fetch SUSFS 4.14 patch (is gitlab.com reachable?)"
     log "applying SUSFS 4.14 kernel patch"
     patch -p1 --forward < "$SUSFS_PATCH_DIR/kernel_patches/50_add_susfs_in_kernel-4.14.patch" \
-        || log "patch reported rejects (expected: 2, fixed in stage 6)"
+        || log "patch reported rejects (expected: 2, re-applied in stages 6 and 6.5)"
 else
     log "SUSFS kernel patch already applied"
 fi
@@ -274,6 +313,50 @@ RECONCILE="scripts/susfs_414_reconcile.py"
 [[ -f "$RECONCILE" ]] || die "$RECONCILE missing (must be committed to the repo)"
 log "reconciling v1.5.5 patch with v2.3.0 core"
 python3 "$RECONCILE" || die "reconcile failed"
+
+# --------------------------- 6.5. SUSFS SPOOF_UNAME hook for newuname
+# The patch's kernel/sys.c hunk cannot apply: the tree's newuname() carries the
+# Xiaomi/openela FAKE_UNAME bpfloader block between memcpy() and up_read().
+# Without this stage, CONFIG_KSU_SUSFS_SPOOF_UNAME=y compiles but uname spoof is
+# silently inert (susfs_spoof_uname never runs). Insert the same hook the hunk
+# would have added, right before up_read().
+python3 - <<'PY'
+import sys
+p = "kernel/sys.c"
+s = open(p).read()
+if "susfs_spoof_uname" in s:
+    print("[sukisu] SPOOF_UNAME hook already present")
+    sys.exit(0)
+extern = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+          "extern void susfs_spoof_uname(struct new_utsname *tmp);\n"
+          "#endif\n"
+          "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n"
+          "{")
+old_extern = "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n{"
+if old_extern not in s:
+    sys.exit("[sukisu] ERROR: newuname anchor missing")
+s = s.replace(old_extern, extern, 1)
+old_call = ("#endif\n"
+            "\tup_read(&uts_sem);\n"
+            "\tif (copy_to_user(name, &tmp, sizeof(tmp)))\n"
+            "\t\treturn -EFAULT;\n"
+            "\n"
+            "\tif (override_release(")
+new_call = ("#endif\n"
+            "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+            "\tsusfs_spoof_uname(&tmp);\n"
+            "#endif\n"
+            "\tup_read(&uts_sem);\n"
+            "\tif (copy_to_user(name, &tmp, sizeof(tmp)))\n"
+            "\t\treturn -EFAULT;\n"
+            "\n"
+            "\tif (override_release(")
+if old_call not in s:
+    sys.exit("[sukisu] ERROR: uts_sem anchor missing")
+s = s.replace(old_call, new_call, 1)
+open(p, "w").write(s)
+print("[sukisu] SPOOF_UNAME hook installed (extern + call before up_read)")
+PY
 
 rm -f fs/proc/task_mmu.c.rej kernel/sys.c.rej
 find . -name '*.orig' -delete 2>/dev/null || true
@@ -328,6 +411,7 @@ done
 for f in fs/exec.c fs/open.c kernel/reboot.c kernel/sys.c drivers/input/input.c; do
     grep -q 'ksu_handle' "$f" || die "hook missing in $f"
 done
+grep -q 'susfs_spoof_uname' kernel/sys.c || die "SPOOF_UNAME hook missing in kernel/sys.c (stage 6.5 did not run)"
 [[ -f fs/susfs.c ]] || die "fs/susfs.c missing"
 grep -q 'susfs' fs/Makefile || die "fs/Makefile not wired for susfs"
 grep -q 'SUSFS_VERSION' include/linux/susfs.h || die "susfs.h missing version"
