@@ -43,7 +43,7 @@ on:
         required: false
         default: ''
       ksu_no_preinit:
-        description: 'true' to drop the SukiSU preinit runner (SUSFS-flavoured PID 1 execve swap) -- keeps CONFIG_KSU_SUSFS=y otherwise
+        description: "'true' drops the SukiSU preinit runner (SUSFS-only PID 1 execve swap); CONFIG_KSU_SUSFS stays =y"
         required: false
         default: 'false'
         type: choice
