@@ -153,13 +153,13 @@ patch("kernel/sys.c",
 "SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)\n"
 "{\n"
 "\tstruct user_namespace *ns = current_user_ns();",
-"#ifdef CONFIG_KSU\n"
+"#ifdef CONFIG_KSU_SUSFS\n"
 "extern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n"
 "#endif\n"
 "\n"
 "SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)\n"
 "{\n"
-"#ifdef CONFIG_KSU\n"
+"#ifdef CONFIG_KSU_SUSFS\n"
 "\tksu_handle_setresuid(ruid, euid, suid);\n"
 "#endif\n"
 "\tstruct user_namespace *ns = current_user_ns();", "kernel/sys.c")
