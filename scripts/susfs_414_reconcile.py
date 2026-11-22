@@ -23,6 +23,33 @@ WHAT IT FIXES
  5. DEFAULT_SUS_MNT_* -> DEFAULT_KSU_MNT_* (+ define the one that is missing)
  6. fsnotify handle_event / fsnotify_add_mark -> 4.14 signatures
  7. missing declarations / includes
+ 8. stamps susfs_def.h with SUSFS_414_COMPAT so CI can prove the reconcile ran
+ 9. (stage numbering kept for CI compatibility)
+10. BOOTLOOP FIX -- gate the v2.3.0 spoof hooks to v1.5.5 semantics.
+    The 4.14 patch wires these v1.5.5-API call sites:
+      * fs/proc/cmdline.c: cmdline_proc_show() unconditionally calls
+        susfs_spoof_cmdline_or_bootconfig() and test-relies on its int
+        return to fall through to saved_command_line.
+      * kernel/sys.c (stage 6.5): newuname() unconditionally calls
+        susfs_spoof_uname().
+    The v2.3.0 core defines both as void and, CRUCIALLY, without checking
+    whether userspace ever programmed the spoof buffer:
+      * susfs_spoof_cmdline_or_bootconfig() does seq_puts(m,
+        fake_cmdline_or_bootconfig) -- a NULL pointer that seq_puts()
+        strlen()s -> page fault -> panic before the boot animation.
+        Android init reads /proc/cmdline very early, so this is a
+        BOOTLOOP, not a cosmetic glitch.
+      * susfs_spoof_uname() strscpy()s from a zeroed my_uname release/
+        version (no NULL deref, but nonsense uname and a needless panic
+        risk if that ever grows).
+    The fix keeps v1.5.5 semantics on the v2.3.0 core:
+      * fs/susfs.c: both functions early-return unless their non-static
+        static key (susfs_is_fake_cmdline_or_bootconfig_buffer_set /
+        susfs_is_uname_spoof_buffer_set) is enabled, i.e. the buffer was
+        programmed by susfs(1) userspace.
+      * fs/proc/cmdline.c: extern decl int->void; the call is now behind
+        static_branch_unlikely() and falls through to saved_command_line
+        when the spoof is unset, exactly the v1.5.5 contract.
 
 Run from the kernel tree root, AFTER the 4.14 patch and the v2.3.0 core are in
 place. Idempotent.
@@ -123,9 +150,12 @@ struct filename *susfs_get_redirected_path(unsigned long ino)
 }
 #endif /* CONFIG_KSU_SUSFS_OPEN_REDIRECT */
 
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-/* v2.3.0's susfs.c calls these; upstream defines them in the fs/namespace.c
- * hunk of the 4.9 patch, which we do not apply. */
+/* v2.3.0's susfs.c calls these from susfs_mark_inode_sus_kstat(), which
+ * is compiled under CONFIG_KSU_SUSFS_SUS_KSTAT -- NOT SUS_MOUNT. Define them
+ * unconditionally or a SUS_KSTAT-without-SUS_MOUNT build (and any
+ * SUSFS_DISABLE bisect of SUS_MOUNT) fails at link with undefined
+ * reference. They only use lock_mount_hash()/real_mount()/DEFAULT_KSU_MNT_ID,
+ * none of which depend on SUSFS_SUS_MOUNT. */
 int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)
 {
 	struct mount *mnt = orig_mnt;
@@ -156,8 +186,6 @@ struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
 	unlock_mount_hash();
 	return &mnt->mnt;
 }
-#endif /* CONFIG_KSU_SUSFS_SUS_MOUNT */
-
 /* SukiSU Nova's sepolicy.c calls this unconditionally under CONFIG_KSU_SUSFS,
  * but no SUSFS release defines it. It is a bookkeeping hook for the avtab
  * "allowed" cache; a no-op is correct and safe. */
@@ -184,7 +212,7 @@ else:
 print("[2] missing macros in susfs_def.h")
 p = "include/linux/susfs_def.h"
 s = read(p)
-if "DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE" in s:
+if "SUSFS_414_COMPAT" in s:
     print("  [skip] already defined")
 else:
     anchor = "#define DEFAULT_KSU_MNT_GROUP_ID 200000"
@@ -194,9 +222,11 @@ else:
            "/* v1.5.5 name kept for the 4.14 patch's fs/namespace.c hunks */\n"
            "#define DEFAULT_SUS_MNT_GROUP_ID DEFAULT_KSU_MNT_GROUP_ID\n"
            "#define DEFAULT_SUS_MNT_ID DEFAULT_KSU_MNT_ID\n"
-           "#define DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE 2000000001")
+           "#define DEFAULT_KSU_MNT_ID_FOR_KSU_PROC_UNSHARE 2000000001\n"
+           "/* marker for CI: the 4.14 reconcile ran (build-kernel-sukisu.yml checks this) */\n"
+           "#define SUSFS_414_COMPAT 1")
     write(p, s.replace(anchor, add, 1))
-    print("  [ok]   added DEFAULT_SUS_MNT_* aliases + KSU_PROC_UNSHARE")
+    print("  [ok]   added DEFAULT_SUS_MNT_* aliases + KSU_PROC_UNSHARE + SUSFS_414_COMPAT")
 
 # ============================================ 3. declare susfs_is_inode_sus_path
 print("[3] declare susfs_is_inode_sus_path in susfs_def.h")
@@ -343,6 +373,47 @@ sub1("fs/susfs.c",
      "\tfsnotify_init_mark(m, NULL);\n\tm->mask = mask;\n\tif (fsnotify_add_mark(m, g, inode, NULL, 0)) {",
      "\tfsnotify_init_mark(m, g);\n\tm->mask = mask;\n\tif (fsnotify_add_mark(m, inode, NULL, 0)) {",
      "fsnotify_add_mark")
+
+# ==================== 10. BOOTLOOP FIX: spoof gates (v1.5.5 semantics)
+print("[10] cmdline / uname spoof gates")
+
+# v1.5.5 patch declared the v2.3.0 void cmdline spoof as int and called it
+# unconditionally; v2.3.0 then seq_puts(NULL) on an unset buffer. Gate both
+# functions on their (non-static) static keys and make cmdline.c fall through
+# to the stock output when the spoof is unset.
+sub1("fs/susfs.c",
+    "void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m) {\n\tunsigned seq;\n\n\tdo {",
+    "void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m) {\n\tunsigned seq;\n\n\tif (!static_key_enabled(&susfs_is_fake_cmdline_or_bootconfig_buffer_set))\n\t\treturn;\n\n\tdo {",
+    "cmdline spoof gate")
+sub1("fs/susfs.c",
+    "void susfs_spoof_uname(struct new_utsname* tmp) {\n\tunsigned seq;\n\n\tdo {",
+    "void susfs_spoof_uname(struct new_utsname* tmp) {\n\tunsigned seq;\n\n\tif (!static_key_enabled(&susfs_is_uname_spoof_buffer_set))\n\t\treturn;\n\n\tdo {",
+    "uname spoof gate")
+
+# cmdline.c: extern decl int->void, add static-key extern + jump_label, and
+# replace the unconditional v1.5.5-style call with a static_branch_unlikely()
+# that falls through to saved_command_line when unconfigured.
+sub1("fs/proc/cmdline.c",
+    "#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern int susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n#endif",
+    "#include <linux/jump_label.h>\n#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\nextern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\nextern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\n#endif",
+    "cmdline.c extern")
+sub1("fs/proc/cmdline.c",
+    "\tif (!susfs_spoof_cmdline_or_bootconfig(m)) {\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}",
+    "\tif (static_branch_unlikely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n\t\tseq_putc(m, '\\n');\n\t\treturn 0;\n\t}",
+    "cmdline.c gated call")
+
+# Hard-fail: a boot-critical bridge must be in place, not warned about.
+s = read("fs/proc/cmdline.c")
+if "static_branch_unlikely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)" not in s:
+    sys.exit("  [ERROR] cmdline.c gated call missing after rewrite")
+if "extern int susfs_spoof_cmdline_or_bootconfig" in s:
+    sys.exit("  [ERROR] cmdline.c still declares the v1.5.5 int prototype")
+s = read("fs/susfs.c")
+for gate in ("static_key_enabled(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)",
+             "static_key_enabled(&susfs_is_uname_spoof_buffer_set)"):
+    if gate not in s:
+        sys.exit("  [ERROR] spoof gate missing in fs/susfs.c: %s" % gate)
+print("  [ok]   spoof gates verified")
 
 # ============================================================== 9. verify
 print("[9] verify")

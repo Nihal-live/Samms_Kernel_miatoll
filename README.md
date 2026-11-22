@@ -11,9 +11,15 @@
 source tree at the root** plus the SKYNET documentation, build tooling, AnyKernel3 template and
 CI workflows for the **"17" line**.
 
-> **Status:** full `4.14.357-openela` source in-tree. Clean / stock-like configuration — no
-> KernelSU, SUSFS or other root/hiding integrations. Flashable AnyKernel3 ZIPs are built by
-> GitHub Actions; no ZIP is committed and no build has been validated on hardware yet.
+> **Status:** full `4.14.357-openela` source in-tree. Flashable AnyKernel3 ZIPs are built by
+> GitHub Actions; no ZIP is committed and no build has been validated on hardware yet. The
+> default `Build SKYNET kernel` workflow stays stock-like; a separate
+> `Build SKYNET kernel + SukiSU Nova + SUSFS` workflow
+> ([`.github/workflows/build-kernel-sukisu.yml`](.github/workflows/build-kernel-sukisu.yml))
+> integrates **SukiSU Nova** at kernel level plus **SUSFS v2.3.0** root-hiding via
+> `scripts/sukisu-setup.sh` + `scripts/susfs_414_reconcile.py` (run CI-side, reproducible from a
+> clean checkout). See [`docs/RELEASING.md`](docs/RELEASING.md) and use the SukiSU **Nova**
+> manager (`com.sukisu.nova`) on flashed devices.
 
 ## Where the kernel source lives
 

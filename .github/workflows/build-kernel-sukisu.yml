@@ -6,8 +6,9 @@ name: Build SKYNET kernel + SukiSU Nova + SUSFS (AnyKernel3 ZIP)
 #
 # The whole integration is applied by scripts/sukisu-setup.sh on every run, so
 # the build is reproducible from a clean checkout -- nothing depends on a local
-# working tree. Only two files need to be committed:
+# working tree. The files that need to be committed are:
 #   scripts/sukisu-setup.sh
+#   scripts/susfs_414_reconcile.py   (stage 6: bridge v1.5.5 patch -> v2.3.0 core)
 #   .github/workflows/build-kernel-sukisu.yml
 
 on:
@@ -37,10 +38,23 @@ on:
         options:
           - 'true'
           - 'false'
+      susfs_disable:
+        description: Space-separated SUSFS symbols to disable (bisect; empty = full SUSFS)
+        required: false
+        default: ''
+      ksu_no_preinit:
+        description: "'true' drops the SukiSU preinit runner (SUSFS-only PID 1 execve swap); CONFIG_KSU_SUSFS stays =y"
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
   push:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
       - 'scripts/sukisu-setup.sh'
+      - 'scripts/susfs_414_reconcile.py'
       - 'scripts/build.sh'
       - 'scripts/package-anykernel.sh'
       - 'arch/arm64/configs/vendor/xiaomi/miatoll_defconfig'
@@ -86,6 +100,9 @@ jobs:
           ls "$HOME/clang/bin/ld.lld"
 
       - name: Apply SukiSU Nova + SUSFS integration
+        env:
+          SUSFS_DISABLE: ${{ inputs.susfs_disable || '' }}
+          KSU_NO_PREINIT: ${{ inputs.ksu_no_preinit == 'true' && '1' || '0' }}
         run: |
           chmod +x scripts/sukisu-setup.sh
           ./scripts/sukisu-setup.sh
@@ -107,19 +124,26 @@ jobs:
         env:
           TARGET: ${{ inputs.target || 'Image.gz-dtb' }}
           NO_POLLY: ${{ inputs.no_polly || 'true' }}
+          SUSFS_DISABLE: ${{ inputs.susfs_disable || '' }}
         run: |
           EXTRA=()
           if [ "$NO_POLLY" = "true" ]; then EXTRA+=(--no-polly); fi
+          set -o pipefail
           ./scripts/build.sh --clang-dir "$HOME/clang/bin" \
-            --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}"
+            --jobs "$(nproc)" --target "$TARGET" "${EXTRA[@]}" 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build-${GITHUB_RUN_NUMBER}.log"
 
           echo "--- CONFIG_KSU / SUSFS in generated .config ---"
           grep -E '^CONFIG_(KSU|KALLSYMS|KPROBES)' out/.config || {
             echo "::error::CONFIG_KSU did not survive into .config"; exit 1; }
-          grep -E '^CONFIG_KSU_SUSFS' out/.config || {
-            echo "::error::CONFIG_KSU_SUSFS did not survive into .config"; exit 1; }
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
-            echo "::error::CONFIG_KSU_SUSFS is not =y"; exit 1
+          if [[ " ${SUSFS_DISABLE:-} " != *" CONFIG_KSU_SUSFS "* ]]; then
+            grep -E '^CONFIG_KSU_SUSFS' out/.config || {
+              echo "::error::CONFIG_KSU_SUSFS did not survive into .config"; exit 1; }
+            if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
+              echo "::error::CONFIG_KSU_SUSFS is not =y"; exit 1
+            fi
+          else
+            echo "CONFIG_KSU_SUSFS disabled via susfs_disable input; skipping SUSFS checks"
           fi
 
           echo "--- kernel.release ---"
@@ -131,6 +155,14 @@ jobs:
           esac
           echo "--- boot artefacts ---"
           ls -lh out/arch/arm64/boot/ || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log-${{ github.run_number }}
+          path: build-${{ github.run_number }}.log
+          if-no-files-found: ignore
 
       - name: Package AnyKernel3 ZIP
         id: package

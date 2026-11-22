@@ -150,3 +150,15 @@ skynet-*.zip
 __pycache__/
 *.pyc
 .DS_Store
+
+# SukiSU-Nova / SUSFS CI-integrated files (recreated by scripts/sukisu-setup.sh, must never be committed)
+/KernelSU/
+KernelSU/
+drivers/kernelsu
+fs/susfs.c
+include/linux/susfs.h
+include/linux/susfs_def.h
+fs/Makefile.orig
+include/linux/Makefile.orig
+*.rej
+*.orig
