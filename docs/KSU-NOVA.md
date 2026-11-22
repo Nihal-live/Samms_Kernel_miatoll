@@ -23,10 +23,12 @@ tree:
 3. **Apply two 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
    exist before 5.10) and raise the KPM guard from 4.4 to 5.10 so KPM's dead
    code is actually dead.
-4. **Insert the four manual hook call sites** a 4.14 kernel needs — see
+4. **Insert the six manual hook call sites** a 4.14 kernel needs — see
    [Hooks](#hooks).
-5. **Inject the defconfig symbols** (`CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
-   `CONFIG_KALLSYMS_ALL`, and an explicit `# CONFIG_KPM is not set`).
+5. **Inject the defconfig symbols** — `CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
+   `CONFIG_KALLSYMS_ALL`, plus explicit `# CONFIG_KPM is not set` and
+   `# CONFIG_KSU_SUSFS is not set`. Both of the latter default to *on* upstream,
+   so "not mentioned" is not the same as "off".
 
 Nothing is committed pre-applied: `git status` on a fresh checkout is clean.
 
@@ -78,13 +80,19 @@ vendored patch.
 | `kernel/reboot.c` | `SYSCALL_DEFINE4(reboot)` | `ksu_handle_sys_reboot()` |
 | `kernel/sys.c` | `SYSCALL_DEFINE3(setresuid)` | `ksu_handle_setresuid()` |
 | `drivers/input/input.c` | `input_handle_event()` | `ksu_handle_input_handle_event()` |
+| `fs/open.c` | `SYSCALL_DEFINE3(faccessat)` | `ksu_handle_faccessat()` |
+| `fs/stat.c` | `vfs_statx()` | `ksu_handle_stat()` |
 
-Deliberately **not** hooked: `faccessat` and `vfs_statx`. They only implement
-the legacy in-kernel "syscall su" path used by the SUSFS-enabled handlers; on
-this tree the corresponding handlers take a `struct filename **` while 4.14 has
-a `const char __user *` at that point. Passing it compiles — separate
-translation units — and corrupts a pointer at runtime. `su` itself goes through
-the execve hook, which is present.
+The last two are what make an app's `access()`/`stat()` of `/system/bin/su`
+resolve to the su wrapper, so `which su` and Termux-style probing work. Their
+signatures only line up because `CONFIG_KSU_SUSFS` is **off**: with SUSFS
+enabled the same handlers take a `struct filename **`, which 4.14's
+`const char __user *` is not — passing it compiles (separate translation units)
+and corrupts a pointer at runtime. That is one more reason the defconfig pins
+`# CONFIG_KSU_SUSFS is not set`.
+
+Deliberately **not** hooked: `vfs_read` (`ksu_handle_vfs_read`), which only
+serves the legacy syscall-su path this ref does not use.
 
 ## Traps this integration defends against
 

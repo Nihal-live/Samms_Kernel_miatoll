@@ -141,7 +141,7 @@ Two build flavours exist, and they differ only in what is applied before `make`:
 | Root | *Build SKYNET kernel + SukiSU-Nova root* | SukiSU-Nova `builtin`, kernel-level |
 
 The root flavour is produced by [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh), which
-pins SukiSU-Nova to a commit, wires `drivers/kernelsu`, patches the four manual hook call sites a
+pins SukiSU-Nova to a commit, wires `drivers/kernelsu`, patches the six manual hook call sites a
 4.14 kernel needs, applies two 4.14 fixes to the clone, and injects the `CONFIG_KSU*` symbols into
 the defconfig. Nothing is committed pre-applied: a clean checkout stays a clean kernel tree.
 

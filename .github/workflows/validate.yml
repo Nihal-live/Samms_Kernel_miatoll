@@ -63,13 +63,16 @@ jobs:
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig
 
           # Hooks: one call per site, and setresuid's call inside setresuid().
-          for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c; do
+          for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
+                   fs/open.c fs/stat.c; do
             test "$(grep -c 'ksu_handle' "$f")" -eq 1
           done
-          grep -A2 'SYSCALL_DEFINE3(setresuid, uid_t, ruid' kernel/sys.c \
-            | grep -q 'ksu_handle_setresuid(ruid, euid, suid)'
-          if grep -A6 'SYSCALL_DEFINE2(setregid, gid_t, rgid' kernel/sys.c \
-               | grep -q 'ksu_handle_setresuid'; then
+          # The call sits after the local declarations, so scan the function
+          # body between syscall definitions rather than a fixed line count.
+          awk '/^SYSCALL_DEFINE3\\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+               f && /ksu_handle_setresuid\\(/{found=1} END{exit !found}' kernel/sys.c
+          if awk '/^SYSCALL_DEFINE2\\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+                  f && /ksu_handle_setresuid\\(/{found=1} END{exit !found}' kernel/sys.c; then
             echo "::error::setresuid hook landed in setregid()"; exit 1
           fi
 

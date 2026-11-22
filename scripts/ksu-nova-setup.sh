@@ -260,19 +260,26 @@ grep -q 'KSU_CAN_USE_KPM' "$KSU_DIR/kernel/kernel_compat.h" || die "KPM guard va
 # how the setresuid hook once landed in setregid(): both bodies open with the
 # same three lines, and the first match wins.
 #
-# NOT hooked, deliberately:
-#   * SYSCALL_DEFINE3(faccessat) / vfs_statx -- these only implement the legacy
-#     in-kernel "syscall su" path that the SUSFS-enabled handlers rely on.
-#     Without SUSFS the handlers take a `struct filename **`, which 4.14's
-#     `const char __user *` is not; passing it compiles (separate TU) and
-#     corrupts memory at runtime. `su` is handled by the execve hook.
-#   * ksu_handle_devpts / ksu_handle_vfs_read -- not used by this ref.
+# faccessat and vfs_statx are hooked too: they are what makes an app's
+# stat()/access() of /system/bin/su resolve to the su wrapper. Their signatures
+# only line up because CONFIG_KSU_SUSFS is off -- with SUSFS enabled the same
+# handlers take a `struct filename **`, which 4.14's `const char __user *` is
+# not, and passing it compiles (separate TU) and corrupts memory at runtime.
+# The defconfig assertion below keeps SUSFS off for exactly this reason.
+#
+# NOT hooked: ksu_handle_vfs_read (ksu_vfs_read_hook) -- the read-side hook is
+# only needed by the legacy syscall-su path this ref does not use.
 
 if [[ "$MODE" != check ]]; then
     python3 - <<'PY'
 import sys
 
-# (file, extern block, declaration anchor, body anchor, call block, label)
+# (file, extern block, declaration anchor, insert-after anchor, call block, label)
+#
+# The call is inserted *after* the local declarations, not right after the
+# opening brace: the kernel builds with -Wdeclaration-after-statement, and a
+# statement before the declarations is the one thing here that a stricter
+# downstream -Werror would reject.
 HOOKS = [
     (
         "fs/exec.c",
@@ -300,7 +307,10 @@ HOOKS = [
         "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,",
         "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n"
         "\t\tvoid __user *, arg)\n"
-        "{\n",
+        "{\n"
+        "\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n"
+        "\tchar buffer[256];\n"
+        "\tint ret = 0;\n",
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
         "#endif\n",
@@ -313,7 +323,12 @@ HOOKS = [
         "#endif\n\n",
         "SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)",
         "SYSCALL_DEFINE3(setresuid, uid_t, ruid, uid_t, euid, uid_t, suid)\n"
-        "{\n",
+        "{\n"
+        "\tstruct user_namespace *ns = current_user_ns();\n"
+        "\tconst struct cred *old;\n"
+        "\tstruct cred *new;\n"
+        "\tint retval;\n"
+        "\tkuid_t kruid, keuid, ksuid;\n",
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_setresuid(ruid, euid, suid);\n"
         "#endif\n",
@@ -328,16 +343,55 @@ HOOKS = [
         "static void input_handle_event(struct input_dev *dev,",
         "static void input_handle_event(struct input_dev *dev,\n"
         "\t\t\t       unsigned int type, unsigned int code, int value)\n"
-        "{\n",
+        "{\n"
+        "\tint disposition = input_get_disposition(dev, type, code, &value);\n",
         "#ifdef CONFIG_KSU\n"
         "\tksu_handle_input_handle_event(&type, &code, &value);\n"
         "#endif\n",
         "drivers/input/input.c input_handle_event -> ksu_handle_input_handle_event()",
     ),
+    (
+        "fs/open.c",
+        "#ifdef CONFIG_KSU\n"
+        "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n"
+        "\t\t\t\t int *mode, int *flags);\n"
+        "#endif\n\n",
+        "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)",
+        "SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)\n"
+        "{\n"
+        "\tconst struct cred *old_cred;\n"
+        "\tstruct cred *override_cred;\n"
+        "\tstruct path path;\n"
+        "\tstruct inode *inode;\n"
+        "\tstruct vfsmount *mnt;\n"
+        "\tint res;\n"
+        "\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n",
+        "#ifdef CONFIG_KSU\n"
+        "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+        "#endif\n",
+        "fs/open.c faccessat -> ksu_handle_faccessat()",
+    ),
+    (
+        "fs/stat.c",
+        "#ifdef CONFIG_KSU\n"
+        "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+        "#endif\n\n",
+        "int vfs_statx(int dfd, const char __user *filename, int flags,",
+        "int vfs_statx(int dfd, const char __user *filename, int flags,\n"
+        "\t      struct kstat *stat, u32 request_mask)\n"
+        "{\n"
+        "\tstruct path path;\n"
+        "\tint error = -EINVAL;\n"
+        "\tunsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_AUTOMOUNT;\n",
+        "#ifdef CONFIG_KSU\n"
+        "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+        "#endif\n",
+        "fs/stat.c vfs_statx -> ksu_handle_stat()",
+    ),
 ]
 
 failed = False
-for path, extern, decl_anchor, body_anchor, call, label in HOOKS:
+for path, extern, decl_anchor, after_anchor, call, label in HOOKS:
     try:
         src = open(path).read()
     except FileNotFoundError:
@@ -350,7 +404,8 @@ for path, extern, decl_anchor, body_anchor, call, label in HOOKS:
         continue
 
     bad = False
-    for what, anchor in (("declaration", decl_anchor), ("call site", body_anchor)):
+    for what, anchor in (("declaration", decl_anchor),
+                         ("local declarations", after_anchor)):
         count = src.count(anchor)
         if count != 1:
             print("[ksu-nova] ERROR: %s %s anchor matches %d times in %s "
@@ -360,13 +415,19 @@ for path, extern, decl_anchor, body_anchor, call, label in HOOKS:
         continue
 
     src = src.replace(decl_anchor, extern + decl_anchor, 1)
-    body_at = src.index(body_anchor)
-    src = src.replace(body_anchor, body_anchor + call, 1)
+    decl_at = src.index(decl_anchor)
 
-    # The call must sit inside the function we aimed at: between its opening
-    # brace and the end of the anchor block, not somewhere earlier in the file.
+    # Insert after the last local declaration, keeping the blank line that
+    # follows it where there is one.
+    at = src.index(after_anchor) + len(after_anchor)
+    if src[at:at + 1] == "\n":
+        at += 1            # anchor ended on "{\n" / a declaration line
+    src = src[:at] + call + src[at:]
+
+    # The call must sit inside the function we aimed at: after its signature
+    # and before the next function starts.
     call_at = src.index(call)
-    if not (body_at < call_at <= body_at + len(body_anchor)):
+    if not (decl_at < call_at <= decl_at + 2000):
         print("[ksu-nova] ERROR: %s hook landed outside its function" % path)
         failed = True
         continue
@@ -382,16 +443,30 @@ fi
 # Confirm the entry points this kernel calls actually exist in the clone, so a
 # rebase of SukiSU-Nova cannot leave us calling a function with a new signature.
 for sym in ksu_handle_execveat ksu_handle_sys_reboot ksu_handle_setresuid \
-           ksu_handle_input_handle_event; do
+           ksu_handle_input_handle_event ksu_handle_faccessat ksu_handle_stat; do
     grep -rqs "$sym" "$KSU_DIR/kernel" || die "$sym not found in $KSU_DIR/kernel"
 done
-for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c; do
+for f in fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c \
+         fs/open.c fs/stat.c; do
     grep -q 'ksu_handle' "$f" || die "hook missing in $f"
 done
-# setresuid must be in setresuid(), not in the neighbouring setregid().
-grep -A2 'SYSCALL_DEFINE3(setresuid, uid_t, ruid' kernel/sys.c | grep -q ksu_handle_setresuid \
-    || die "ksu_handle_setresuid() is not inside setresuid()"
-ok "manual hook call sites in place (exec, reboot, setresuid, input)"
+# setresuid must be in setresuid(), not in the neighbouring setregid(), which
+# opens with the same three lines. Scan the function body between syscall
+# definitions instead of a fixed number of lines: the call sits after the local
+# declarations, so its distance from the signature is not fixed.
+inside_setresuid() {
+    awk '/^SYSCALL_DEFINE3\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+         f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
+}
+inside_setregid() {
+    awk '/^SYSCALL_DEFINE2\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
+         f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
+}
+inside_setresuid || die "ksu_handle_setresuid() is not inside setresuid()"
+if inside_setregid; then
+    die "ksu_handle_setresuid() landed in setregid()"
+fi
+ok "manual hook call sites in place (exec, faccessat, stat, reboot, setresuid, input)"
 
 # -------------------------------------------------------------- 5. defconfig ---
 
@@ -428,28 +503,39 @@ wanted += ["CONFIG_KALLSYMS=y", "CONFIG_KALLSYMS_ALL=y"]
 # also documents that the choice was made on purpose.
 wanted += ["# CONFIG_KPM is not set"]
 
-text = open(defconfig).read()
-names = {w.split("=")[0].lstrip("# ").strip() for w in wanted}
+# SukiSU-Nova declares `CONFIG_KSU_SUSFS` default y, depending only on KSU and
+# THREAD_INFO_IN_TASK. Leaving it unset selects it, and then its fs/mm/security
+# hooks reference susfs_* symbols this kernel does not have -- a link failure at
+# best. It has to be turned off explicitly, and that switch is also what keeps
+# the faccessat/stat handlers on their 4.14 signatures.
+if has_config("KSU_SUSFS"):
+    wanted.append("# CONFIG_KSU_SUSFS is not set")
 
-# Remember what the defconfig says today, then rewrite only what differs, so
-# re-running the script is a no-op and git stays clean.
-present, out = {}, []
+text = open(defconfig).read()
+names = {re.match(r'^(?:# )?(CONFIG_[A-Z0-9_]+)', w).group(1) for w in wanted}
+
+# Rebuild the block instead of merging into it: strip every existing line for
+# these symbols and the marker we append, then write the canonical block back.
+# An earlier version dropped the matching lines and only re-added the ones that
+# had changed, which silently deleted CONFIG_KSU=y from the file.
+out = []
 for line in text.splitlines():
     m = re.match(r'^(?:# )?(CONFIG_[A-Z0-9_]+)(?: is not set|=[^\n]*)$', line)
     if m and m.group(1) in names:
-        present[m.group(1)] = line
-        continue          # stale value; re-added below if still wanted
+        continue
     out.append(line)
+while out and out[-1].strip() == "":
+    out.pop()
+while out and out[-1].startswith("# --- SukiSU-Nova"):
+    out.pop()
+    while out and out[-1].strip() == "":
+        out.pop()
 
-changed = [w for w in wanted
-           if present.get(w.split("=")[0].lstrip("# ").strip()) != w]
+new_text = "\n".join(out + ["", "# --- SukiSU-Nova (kernel-level root) ---"] + wanted) + "\n"
 
-if changed:
-    out.append("")
-    out.append("# --- SukiSU-Nova (kernel-level root) ---")
-    out.extend(changed)
-    open(defconfig, "w").write("\n".join(out) + "\n")
-    print("[ksu-nova]   defconfig: %d symbol(s) added/updated" % len(changed))
+if new_text != text:
+    open(defconfig, "w").write(new_text)
+    print("[ksu-nova]   defconfig: SukiSU-Nova block written (%d symbol(s))" % len(wanted))
 else:
     print("[ksu-nova]   defconfig already complete")
 PY
@@ -465,6 +551,10 @@ fi
 grep -qx '# CONFIG_KPM is not set' "$DEFCONFIG" || die "defconfig must keep KPM off"
 if grep -qE '^CONFIG_KSU_SUSFS' "$DEFCONFIG"; then
     die "stale CONFIG_KSU_SUSFS* symbol in defconfig"
+fi
+if grep -q '^config KSU_SUSFS' "$KSU_DIR/kernel/Kconfig"; then
+    grep -qx '# CONFIG_KSU_SUSFS is not set' "$DEFCONFIG" \
+        || die "defconfig must switch CONFIG_KSU_SUSFS off (upstream default is y)"
 fi
 ok "defconfig: CONFIG_KSU=y, ADB root on, KPM off, no SUSFS symbols"
 
