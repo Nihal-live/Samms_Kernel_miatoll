@@ -129,10 +129,12 @@ jobs:
           echo "--- KSU hooks (setresuid must be in setresuid, not setregid) ---"
           grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' fs/exec.c kernel/reboot.c \
                    kernel/sys.c drivers/input/input.c fs/open.c fs/stat.c
-          awk '/^SYSCALL_DEFINE3\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-               f && /ksu_handle_setresuid\(/{print "  " $0}' kernel/sys.c
-          awk '/^SYSCALL_DEFINE2\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-               f && /ksu_handle/{print "  UNEXPECTED: " $0}' kernel/sys.c
+          awk 'BEGIN{f=0}
+               /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
+               f && index($0, "ksu_handle_setresuid(") { print "  " $0 }' kernel/sys.c
+          awk 'BEGIN{f=0}
+               /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
+               f && index($0, "ksu_handle") { print "  UNEXPECTED: " $0 }' kernel/sys.c
           echo "--- defconfig ---"
           grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS|^# CONFIG_KPM' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 

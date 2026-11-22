@@ -69,14 +69,18 @@ jobs:
                    fs/open.c fs/stat.c; do
             test "$(grep -cE '^[[:space:]]+ksu_handle_[a-z_]+\(' "$f")" -eq 1
           done
-          # The call sits after the local declarations, so scan the function
-          # body between syscall definitions rather than a fixed line count.
-          awk '/^SYSCALL_DEFINE3\(setresuid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-               f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c
-          if awk '/^SYSCALL_DEFINE2\(setregid,/{f=1;next} /^SYSCALL_DEFINE/{f=0}
-                  f && /ksu_handle_setresuid\(/{found=1} END{exit !found}' kernel/sys.c; then
+          awk 'BEGIN{f=0;found=0}
+               /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setresuid,")) f=1; next }
+               f && index($0, "ksu_handle_setresuid(") { found=1 }
+               END { exit !found }' kernel/sys.c
+          if awk 'BEGIN{f=0;found=0}
+                  /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
+                  f && index($0, "ksu_handle_setresuid(") { found=1 }
+                  END { exit !found }' kernel/sys.c; then
             echo "::error::setresuid hook landed in setregid()"; exit 1
           fi
+          # The call sits after the local declarations, so scan the function
+          # body between syscall definitions rather than a fixed line count.
 
           # The two Nova 4.14 fixes must be present.
           grep -q 'KSU_CAN_USE_KPM' KernelSU/kernel/kernel_compat.h
