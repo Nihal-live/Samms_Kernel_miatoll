@@ -143,6 +143,43 @@ grep -q 'kernelsu' drivers/Makefile || die "drivers/Makefile not wired"
 grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || die "drivers/Kconfig not wired"
 log "upstream wiring OK"
 
+# ------------------------------------------- 2.5. optional KSU_NO_PREINIT
+# SukiSU-Nova's CONFIG_KSU_SUSFS flavour embeds a "preinit runner": a static
+# ELF that is .incbin'ed into .init.rodata and swapped in as PID 1's first
+# execve target ("/system/bin/init selinux_setup"). If the runner path is
+# suspected (it is the one early-boot code path that only exists with SUSFS),
+# set KSU_NO_PREINIT=1 to make the build take the EXACT same branch upstream
+# takes when the exported UAPI headers are unavailable: no runner objects are
+# linked and preinit.h compiles to inline no-ops. PID 1 then execs the real
+# /system/bin/init untouched -- the same as a non-SUSFS (Nova) build except
+# that CONFIG_KSU_SUSFS stays =y.
+if [[ "${KSU_NO_PREINIT:-0}" == "1" ]]; then
+    log "KSU_NO_PREINIT=1: removing the preinit runner from the build"
+    python3 - <<'PY'
+import sys
+p = "KernelSU/kernel/Makefile"
+s = open(p).read()
+BEGIN = "ifneq ($(wildcard $(KSU_UAPI_INC)/linux/unistd.h),)\n"
+END = "\n# ===== end preinit runner ====="
+if "SUKSKIP-preinit" in s:
+    print("[sukisu] preinit already disabled")
+    sys.exit(0)
+i = s.find(BEGIN)
+j = s.find(END)
+if i < 0 or j < 0 or j <= i:
+    sys.exit("[sukisu] ERROR: preinit block not found in KernelSU/kernel/Makefile (anchors moved?)")
+STUB = ("# SUKSISKIP-preinit: disabled by sukisu-setup.sh (KSU_NO_PREINIT=1).\n"
+        "# Same branch upstream takes when the exported UAPI headers are missing:\n"
+        "# no runner objects, preinit.h compiles to inline no-ops, PID 1 execs\n"
+        "# the real /system/bin/init untouched.\n"
+        "ccflags-y += -DKSU_NO_PREINIT\n"
+        "$(info -- KernelSU: preinit disabled via sukisu-setup.sh)")
+s = s[:i] + STUB + s[j:]
+open(p, "w").write(s)
+print("[sukisu] KSU preinit runner disabled (-DKSU_NO_PREINIT)")
+PY
+fi
+
 # ------------------------------------------------- 2. 4.14 compatibility fixes
 # (a) linux/static_call.h only exists on 5.10+; the include is unused on 4.14.
 python3 - <<'PY'

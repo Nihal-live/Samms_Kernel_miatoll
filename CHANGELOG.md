@@ -68,6 +68,14 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   `susfs_is_uname_spoof_buffer_set`) are enabled, and `cmdline_proc_show()` now falls through to the
   stock `saved_command_line` output when the spoof is unset. `kernel/sys.c` SPOOF_UNAME path keeps
   working (the inner gate now makes the call a no-op until userspace configures it).
+- `scripts/sukisu-setup.sh` gained `KSU_NO_PREINIT=1` support: rewrites the
+  SukiSU-Nova `kernel/Makefile` "preinit runner" block into its own upstream
+  "disabled" branch (`-DKSU_NO_PREINIT`, runner objects dropped). This keeps
+  `CONFIG_KSU_SUSFS=y` while eliminating the one early-boot code path that
+  exist only in SUSFS builds at all -- PID 1's `/system/bin/init selinux_setup`
+  execve is no longer swapped to an `.init.rodata` static-ELF runner, matching
+  the known-booting Nova-only build's PID-1 flow. Exposed as the `ksu_no_preinit`
+  workflow input (default `false`).
 - `scripts/sukisu-setup.sh` gained `SUSFS_DISABLE` (space-separated symbols, e.g.
   `SUSFS_DISABLE="CONFIG_KSU_SUSFS_SUS_MOUNT"` or `"CONFIG_KSU_SUSFS"` for a Nova-only control
   build): matching defconfig symbols are written as `# CONFIG_X is not set` (Kconfig default is

@@ -42,6 +42,14 @@ on:
         description: Space-separated SUSFS symbols to disable (bisect; empty = full SUSFS)
         required: false
         default: ''
+      ksu_no_preinit:
+        description: 'true' to drop the SukiSU preinit runner (SUSFS-flavoured PID 1 execve swap) -- keeps CONFIG_KSU_SUSFS=y otherwise
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
   push:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
@@ -94,6 +102,7 @@ jobs:
       - name: Apply SukiSU Nova + SUSFS integration
         env:
           SUSFS_DISABLE: ${{ inputs.susfs_disable || '' }}
+          KSU_NO_PREINIT: ${{ inputs.ksu_no_preinit == 'true' && '1' || '0' }}
         run: |
           chmod +x scripts/sukisu-setup.sh
           ./scripts/sukisu-setup.sh
