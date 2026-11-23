@@ -14,6 +14,13 @@ name: Build SKYNET kernel via KernelSU_Action_V2
 # about the action changes -- its scripts still do every step.
 
 on:
+  # A workflow_dispatch-only workflow is not dispatchable from a branch until
+  # the file exists on the default branch, so a push to the files this pipeline
+  # is made of starts a run too.
+  push:
+    paths:
+      - "ci/ksu-action-v2/**"
+      - ".github/workflows/build-with-ksu-action.yml"
   workflow_dispatch:
     inputs:
       action_ref:
@@ -44,9 +51,13 @@ jobs:
     timeout-minutes: 120
     env:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
-      CONFIG_ENV: ${{ inputs.config }}
+      CONFIG_ENV: ${{ inputs.config || 'config/miatoll.env' }}
       ACTION_DIR: ${{ github.workspace }}/ksu-action
-      ACTION_REF: ${{ inputs.action_ref }}
+      ACTION_REF: ${{ inputs.action_ref || '26c1b95532549d4cb57ab152f5650003d89c6efb' }}
+      # Verbose per-step output from the action's own logging helpers. The
+      # "debug" input exists only to be explicit; verbose is the default here
+      # because that logging is the reason this pipeline is kept.
+      RUNNER_DEBUG: "1"
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
