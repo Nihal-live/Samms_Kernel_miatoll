@@ -203,6 +203,9 @@ jobs:
         env:
           TARGET: ${{ inputs.target || 'Image.gz-dtb' }}
           NO_POLLY: ${{ inputs.no_polly || 'true' }}
+          # The .config assertions below branch on this; without it they
+          # take the root-only path and reject a SUSFS build's own symbols.
+          KSU_SUSFS: ${{ inputs.susfs == 'true' && '1' || '0' }}
         run: |
           set -uo pipefail
           EXTRA=()
