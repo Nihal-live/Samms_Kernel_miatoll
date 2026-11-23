@@ -151,10 +151,12 @@ AVC log spoofing, shell su (adb only), mount hide, app profiles and extensions �
 from the manager — plus **KPM** (`CONFIG_KPM=y`; the built `Image` is post-processed by
 KernelPatch's `kptools` in the same workflow).
 
-What you do not get: **SUSFS**, the kernel-side root-hiding layer — there is no maintained
-4.14 port of the v2.x API SukiSU-Nova calls. Hide SELinux modification and AVC log spoofing
-are implemented natively instead, without it. The reasoning, the hook table, the traps this
-integration defends against and the exact CI assertions are in
+The default image has no **SUSFS**, the kernel-side root-hiding layer: hide SELinux modification
+and AVC log spoofing are implemented natively instead, without it. SUSFS itself is available as
+a **second, opt-in build** — `KSU_SUSFS=1 ./scripts/ksu-nova-setup.sh`, or `susfs: true` in CI —
+using the v2.3.0 port that is device-verified booting on non-GKI 4.14 hardware; the default
+build stays the safe choice until that flavour is boot-tested here. The reasoning, the hook
+table, the traps this integration defends against and the exact CI assertions are in
 [`docs/KSU-NOVA.md`](docs/KSU-NOVA.md).
 
 ## The `17` branch

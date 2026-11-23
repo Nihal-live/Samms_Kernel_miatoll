@@ -59,7 +59,7 @@ compiled in unconditionally; only ADB root and KPM have Kconfig switches.
 | Extensions (version spoof, dynamic manager, unmount paths) | yes | |
 | **KPM** (load external kernel modules) | **yes, needs the image patch** | `CONFIG_KPM=y` compiles SukiSU's bridge; `scripts/kpm-patch.sh` injects KernelPatch into the image. See [KPM](#kpm). |
 | **AVC log spoofing** | **yes, native** | the same `avc_dump_query()` rewrite SUSFS performs, driven over the SUSFS `reboot()` supercall — no SUSFS code in the build |
-| **SUSFS** | **no** | see below |
+| **SUSFS** | **opt-in, separate build** | `KSU_SUSFS=1` adds the device-verified 4.14 port of SUSFS v2.3.0. Not in the default image: it hooks the filesystem core. See [SUSFS](#susfs-opt-in-separate-build). |
 
 ## KPM
 
@@ -270,25 +270,97 @@ claim that SUSFS is present, and every other SUSFS command is unanswered.
 - toggling hide: `ksu: selinux_hide: enabled`
 - first AVC toggle: `ksu: avc spoof: masking denials targeting sid NNN`
 
-## Why no SUSFS
+## SUSFS (opt-in, separate build)
 
-SUSFS is a kernel-side root-hiding layer, and there is no upstream branch that
-ships it for 4.14 *with the API SukiSU-Nova calls*:
+Root hiding is a **second product**, built from the same tree behind a switch:
 
-- `simonpunk/susfs4ksu` `kernel-4.14` is frozen at **v1.5.5**.
-- SukiSU-Nova calls the **v2.x** API (`susfs_add_sus_map()`,
-  `susfs_set_priority_uid_filter()`, `susfs_get_enabled_features()`,
-  `susfs_show_variant()`), so linking against v1.5.5 fails with undefined
-  symbols.
-- No branch is both 4.14 and v2.x.
+```sh
+KSU_SUSFS=1 ./scripts/ksu-nova-setup.sh      # root + SUSFS
+./scripts/build.sh --clang-dir <clang>/bin
+```
 
-Making it work means maintaining a private rebase of a ~5,400-line patch
-against every upstream move, plus a second userspace component that must speak
-the same protocol version. A half-ported hiding layer is exactly the class of
-change that turns a working root into an unstable device, which is why this
-build leaves it out. If you want hiding later, the honest options are: follow a
-tree that ports SUSFS to 4.14 upstream, or accept the maintenance of the
-vendored patch.
+In CI that is the `susfs` input (`susfs: true`), and the ZIP, the artifact and
+the release notes get a `-susfs` suffix. The default build is unchanged.
+
+### Why it is a separate image
+
+SUSFS hooks the filesystem core — `fs/namei.c`, `fs/namespace.c`, `fs/stat.c`,
+`fs/super.c`, `fs/readdir.c`, `mm/memory.c` — so a port can compile, link, and
+still bootloop. Behind a switch, a broken hiding layer costs one build instead
+of the kernel you already trust.
+
+### Which SUSFS, and why
+
+The pinned SukiSU-Nova speaks the **v2.x** supercall ABI, which rules out most
+of what is published for 4.14:
+
+| Candidate | Version | 4.14 | Fits Nova's API | Verdict |
+| --- | --- | --- | --- | --- |
+| `simonpunk/susfs4ksu`, branch `kernel-4.14` (GitLab) | v1.5.5 — frozen ("master stays at 1.3.8 forever") | yes | **no**: no `susfs_add_sus_map()`, `susfs_show_variant()`, `susfs_get_enabled_features()` | rejected: undefined symbols at link |
+| `xiaofan6ya/agate-bakasu-susfs`, `feature/susfs-2.3.4.14-port` | **v2.3.0** | **yes — 4.14.336, device-verified** (boots, root works, manager reports v2.3.0) | yes | **used** |
+| `wxx9248/susfs4ksu` | v2.3.0 | 4.9 only | yes | rejected: wrong line, no 4.14 verification |
+| `ShirkNeko/SukiSU_patch`, `3.10/…v2.4.0` | v2.4.0 | 3.10 only | yes | rejected: wrong line; the one 4.14 file in that bundle is the KernelSU hook glue, not SUSFS |
+| `Bias8145/KsuNext-susfs-msm4.14` | v1.5.3 | yes | no | rejected: v1.x ABI |
+| `zzh20188/GKI_KernelSU_SUSFS` releases | v2.2–v2.3 | GKI only | yes | rejected: GKI tree |
+
+The chosen port is the only candidate that is **both** v2.x **and** verified
+booting on non-GKI 4.14 hardware, and its integration patch was generated
+against 4.14.357 — the exact base of this tree. Its sources apply here without
+a single rejected hunk, which is as close to a compatibility proof as you get
+before flashing.
+
+### What is enabled
+
+`SUS_PATH`, `SUS_MOUNT`, `SUS_KSTAT`, `SPOOF_UNAME`, `ENABLE_LOG`,
+`HIDE_KSU_SUSFS_SYMBOLS`, `SPOOF_CMDLINE_OR_BOOTCONFIG`.
+
+Deliberately **off**, because there is no implementation behind them in this
+port:
+
+- `SUS_MAP` and `OPEN_REDIRECT` ride on the `/proc/pid/maps` rewrite, which
+  needs `seq_put_hex_ll()` and `num_to_str(…, width)` (4.20+). Bringing those
+  in breaks `fs/proc/meminfo.c` and `drivers/of/unittest.c` on 4.14.
+- `PRIORITY_UID_FILTER` is a v2.4-only command. Enabling the symbol would make
+  the manager send a command that has no handler — exactly the "shows as
+  supported, does nothing" failure this tree avoids elsewhere.
+
+### What had to change to fit
+
+| Piece | Why |
+| --- | --- |
+| `fs/super.c` hunk rewritten | upstream's version replaces 4.14's `ida_pre_get()`/`ida_get_new_above()` with the 4.19 `ida_alloc_range()` API. This tree keeps the allocator it boots with and only adds the KernelSU minor-number branch, under `unnamed_dev_lock`, gated on `CONFIG_KSU_SUSFS_SUS_MOUNT` and the KSU domain. |
+| `lib/idr.c` hunk dropped | same API problem; nothing else needs it. |
+| `fs/proc/task_mmu.c`, `task_nommu.c`, `seq_file.c`, `lib/vsprintf.c`, `include/linux/{pkeys,seq_file,kernel}.h` dropped | the `/proc/pid/maps` rewrite above; it also carried non-SUSFS changes. |
+| `security/selinux/hooks.c`, `kernel/sys.c` dropped | KernelSU-Next glue, not SUSFS. The one sys.c hunk worth having — spoofed `uname` — is re-applied here, anchor-checked, inside `newuname()`. |
+| `arch/arm64/configs/vayu_defconfig` dropped | another device's config. |
+| `fs/susfs_compat.c` added | SukiSU-Nova calls four v2.4 entry points v2.3.0 lacks (`susfs_add_sus_type`, `susfs_add_sus_avd_allowed_by_type`, `susfs_set_current_proc_no_su`, `susfs_set_current_proc_umounted_for_zygote_next`). They are no-ops here and each says what is lost; it also implements `susfs_ends_with()` (v2.3.0 ships only the mirror) and owns `susfs_is_avc_log_spoofing_enabled`. |
+
+With SUSFS in the build the AVC toggle belongs to SUSFS:
+`avc_dump_query()` still performs the rewrite through `ksu_avc_log_spoof_matches()`,
+but the flag is `susfs_set_avc_log_spoofing()`'s, the SID is resolved once at
+the init second stage, and `reboot()` no longer answers the supercall — the
+SUSFS dispatch does.
+
+### What CI proves, and what it does not
+
+`validate.yml` applies the two-patch stack on a clean checkout and asserts that
+no hunk was rejected, every shim exists, the 4.14 IDA API is intact, `SUS_MAP`
+and `PRIORITY_UID_FILTER` stayed off, `susfs_spoof_uname()` is inside
+`newuname()`, and the setresuid hook is in `setresuid()`. The build workflow
+then proves it **compiles and links**.
+
+That is all it proves. **SUSFS has not been boot-tested on miatoll** by this
+tree: the port's evidence comes from a different 4.14.336 device. Flash it with
+a known-good boot image at hand, and expect the default (root-only) image to
+stay the safe choice until someone reports a boot.
+
+### What the manager should show
+
+SUSFS reports itself over the same `reboot()` supercall the manager already
+uses: `SHOW_VERSION` → `v2.3.0`, `SHOW_VARIANT` → `NON-GKI`,
+`SHOW_ENABLED_FEATURES` → the seven symbols above. The hiding panels then
+enable, and `grep susfs /proc/kallsyms` stays empty because
+`HIDE_KSU_SUSFS_SYMBOLS` is on.
 
 ## Hooks
 
@@ -367,7 +439,9 @@ The dry run additionally asserts that the SELinux work is in place:
 
 It proves the kernel **compiles and links with root integrated**. It does not
 prove the kernel boots, that `su` works on your firmware, or that the manager
-detects the kernel version correctly. That needs a device.
+detects the kernel version correctly. That needs a device — and it is true
+twice over for the `susfs` flavour, whose patch stack CI can only verify as
+text (see [SUSFS](#susfs-opt-in-separate-build)).
 
 A dry-run job in [`validate.yml`](../.github/workflows/validate.yml) applies the
 integration without building, so upstream drift fails in about a minute instead
@@ -386,7 +460,8 @@ of after a 40-minute build.
 ## Building it locally
 
 ```sh
-./scripts/ksu-nova-setup.sh                 # apply + verify
+./scripts/ksu-nova-setup.sh                 # apply + verify (root only)
+KSU_SUSFS=1 ./scripts/ksu-nova-setup.sh     # same, plus SUSFS v2.3.0
 ./scripts/ksu-nova-setup.sh --check         # verify only, change nothing
 ./scripts/build.sh --clang-dir <clang>/bin  # defconfig + build
 grep -x 'CONFIG_KSU=y' out/.config          # must be =y, not dropped

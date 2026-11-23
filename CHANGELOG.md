@@ -155,6 +155,37 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   policy).
 - **Not boot-tested.**
 
+#### SUSFS v2.3.0, opt-in, separate build (UNTESTED)
+
+- `KSU_SUSFS=1 ./scripts/ksu-nova-setup.sh` (CI input `susfs: true`) now produces a second image
+  from the same tree, with the SUSFS v2.3.0 hiding layer integrated. The default build is
+  unchanged, because SUSFS hooks `fs/namei.c`, `fs/namespace.c`, `fs/stat.c`, `fs/super.c` and
+  `mm/memory.c` — a port that compiles can still bootloop.
+- Which port, and why: the official 4.14 branch (`simonpunk/susfs4ksu`, GitLab) is frozen at
+  **v1.5.5** and lacks every v2 entry point SukiSU-Nova calls; the v2.4.0 ports are 4.9 and 3.10
+  only. The chosen sources are the v2.3.0 port that is **device-verified booting on non-GKI
+  4.14.336** (`xiaofan6ya/agate-bakasu-susfs`), whose integration patch was generated against
+  **4.14.357** — this tree's exact base — and applies here with zero rejected hunks.
+- Enabled: `SUS_PATH`, `SUS_MOUNT`, `SUS_KSTAT`, `SPOOF_UNAME`, `ENABLE_LOG`,
+  `HIDE_KSU_SUSFS_SYMBOLS`, `SPOOF_CMDLINE_OR_BOOTCONFIG`. Off on purpose: `SUS_MAP` and
+  `OPEN_REDIRECT` (they need the `/proc/pid/maps` rewrite, which needs the 4.20 `seq_file`/
+  `num_to_str` API), and `PRIORITY_UID_FILTER` (v2.4-only command, no handler here).
+- Adaptations: `get_anon_bdev()` keeps the 4.14 `ida_pre_get()`/`ida_get_new_above()` allocator and
+  only gains the KernelSU minor-number branch; `lib/idr.c`, `fs/proc/task_mmu.c`, the
+  `seq_file`/`vsprintf`/`pkeys` includes, the `vayu_defconfig` and the KernelSU-Next
+  `hooks.c`/`sys.c` hunks are dropped; the one `sys.c` hunk worth keeping (spoofed `uname`) is
+  re-applied inside `newuname()` with an anchor check.
+- `fs/susfs_compat.c` supplies the four v2.4 entry points v2.3.0 lacks as documented no-ops, plus
+  `susfs_ends_with()` (v2.3.0 ships only the mirror, and Nova's adb-root check calls both) and the
+  `susfs_is_avc_log_spoofing_enabled` flag. With SUSFS in the build the AVC toggle is SUSFS's and
+  `reboot()` stops answering the supercall.
+- `validate.yml` gained a `SUSFS v2.3.0 integration (dry run)` job that applies the stack and
+  fails on a rejected hunk, a missing shim, the 4.19 IDA API in `get_anon_bdev()`, a
+  `SUS_MAP`/`PRIORITY_UID_FILTER` that should have stayed off, `susfs_spoof_uname()` outside
+  `newuname()`, or the setresuid hook in `setregid()`.
+- **Not boot-tested on miatoll.** The evidence for the port comes from a different 4.14.336
+  device, and CI can only prove the patch stack applies and the kernel links.
+
 #### SELinux hide stays unsupported (by construction, not by omission)
 
 - **SELinux hide** (`selinux_hide`, what the settings screen calls "Hide SELinux modification")
@@ -167,9 +198,9 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 ### Removed
 
 - **SUSFS** from this build: `patches/susfs/` (the vendored v2.4.0 4.14 patch) and
-  `docs/KSU-SUSFS.md` are gone. SUSFS needs a kernel-side port of the API SukiSU-Nova calls, and
-  no upstream branch ships one for 4.14 — maintaining a private 5,400-line rebase plus a matching
-  userspace module is not worth the boot risk it puts on the device.
+  `docs/KSU-SUSFS.md` are gone, because a v2.4-on-4.14 rebase kept by hand was not worth the boot
+  risk it put on the device. *Superseded* by the opt-in v2.3.0 port above, which comes from
+  device-verified sources instead of a hand-maintained rebase and stays out of the default image.
 - `scripts/sukisu-setup.sh` and `scripts/susfs_414_reconcile.py`: the older approach paired the
   v1.5.5 4.14 SUSFS patch with the v2.3.0 core and bridged the API gap with a Python rewriter.
 
