@@ -12,10 +12,10 @@ index e324ce6..d558fa0 100644
            - backslashxx
 diff --git a/config/miatoll.env b/config/miatoll.env
 new file mode 100644
-index 0000000..66e290b
+index 0000000..61857df
 --- /dev/null
 +++ b/config/miatoll.env
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,111 @@
 +# Build profile: Xiaomi Redmi Note 9 Pro / Poco M2 Pro (miatoll), SKYNET kernel.
 +#
 +#   Linux 4.14.357-openela, Clang + LLD, CONFIG_LOCALVERSION=-SKYNET
@@ -34,7 +34,11 @@ index 0000000..66e290b
 +# a frozen build.
 +KERNEL_SOURCE_BRANCH=arena/6930beb9-samms-kernel-miatoll
 +KERNEL_CONFIG=vendor/xiaomi/miatoll_defconfig
-+KERNEL_IMAGE_NAME=Image.gz-dtb
++# A bare `make` produces Image, Image.gz and dtb.img here; Image.gz-dtb is a
++# separate target. The KPM step rebuilds it from Image + dtb.img, and
++# scripts/build.sh switches KERNEL_IMAGE_NAME to it once it exists, so the
++# packaged image is the combined artefact either way.
++KERNEL_IMAGE_NAME=Image.gz
 +ARCH=arm64
 +
 +KERNEL_NAME=miatoll
@@ -123,6 +127,27 @@ index 0000000..66e290b
 +
 +ENABLE_CCACHE=true
 +REMOVE_UNUSED_PACKAGES=true
+diff --git a/scripts/build.sh b/scripts/build.sh
+index 0f62c1b..e8e79fd 100644
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -169,6 +169,16 @@ check_output() {
+ 	# before packaging.
+ 	if is_true "${ENABLE_KPM:-false}"; then
+ 		kpm_patch_image "$image"
++
++		# Trees that append their device trees have a combined artefact
++		# (Image.gz + dtb -> Image.gz-dtb) that a bare `make` does not build,
++		# so KERNEL_IMAGE_NAME has to name the plain image for the check above.
++		# Once the KPM step has rebuilt the combined file, that is the one to
++		# package and count as the kernel image.
++		if [ -f "${boot}/Image.gz-dtb" ] && [ "${KERNEL_IMAGE_NAME}" != "Image.gz-dtb" ]; then
++			ok "packaging Image.gz-dtb ($(du -h "${boot}/Image.gz-dtb" | cut -f1), gzip + dtb)"
++			export_env KERNEL_IMAGE_NAME Image.gz-dtb
++		fi
+ 	fi
+ 
+ 	# Record the version string the kernel actually reports.
 diff --git a/scripts/config.sh b/scripts/config.sh
 index b21b47c..880e7a6 100644
 --- a/scripts/config.sh

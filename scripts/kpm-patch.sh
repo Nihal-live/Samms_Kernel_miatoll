@@ -16,8 +16,10 @@
 #      same thing but hands kptools an embedded kpimg through a memfd, and in
 #      the pinned bundle that payload arrives 16 bytes long -- see section 4.)
 #   2. sanity check that oImage is still an arm64 Image and carries the payload
-#   3. rebuild Image.gz-dtb around it, byte-identically to the kernel's own
-#      rule: gzip(Image) + the DTB blob that was appended to the original
+#   3. rebuild Image.gz and Image.gz-dtb around it, byte-identically to the
+#      kernel's own rule: gzip(Image) + the DTB blob, taken from the original
+#      Image.gz-dtb when present and from dtb.img when make was only asked for
+#      the images (both rules cat the same device tree list)
 #
 #   ./scripts/kpm-patch.sh                 patch in place, verify
 #   ./scripts/kpm-patch.sh --check         verify only, change nothing
@@ -95,7 +97,9 @@ verify_repack() {
     gz_size="$(stat -c%s "$BOOT_DIR/Image.gz")"
     head -c "$gz_size" "$BOOT_DIR/Image.gz-dtb" | cmp -s - "$BOOT_DIR/Image.gz" \
         || die "Image.gz-dtb does not start with Image.gz"
-    dtb_start="$(tail -c +$((gz_size + 1)) "$BOOT_DIR/Image.gz-dtb" | od -An -tx1 -N4 | tr -d ' \n')"
+    # od skips in place; `tail | od -N4` would leave tail writing into a closed
+    # pipe, and with pipefail that "Broken pipe" is a failure of the check.
+    dtb_start="$(od -An -tx1 -j "$gz_size" -N4 "$BOOT_DIR/Image.gz-dtb" | tr -d ' \n')"
     [[ "$dtb_start" == "d00dfeed" ]] \
         || die "Image.gz-dtb does not end with a device tree blob (got $dtb_start)"
     ok "Image.gz decompresses to Image; Image.gz-dtb is gzip + dtb"
@@ -156,6 +160,20 @@ if [[ -f "$BOOT_DIR/Image.gz-dtb" ]]; then
     [[ "$fdt_magic" == "d00dfeed" ]] \
         || log "note: the appended blob does not start with an FDT magic ($fdt_magic)"
     ok "dtb blob: ${DTB_SIZE} bytes"
+elif [[ -f "$BOOT_DIR/dtb.img" ]]; then
+    # A bare `make` on this tree produces Image, Image.gz and dtb.img but not
+    # the combined artefact (that is an explicit make target). Both rules cat
+    # the same $(DTB_OBJS) list in the same order, so Image.gz-dtb is exactly
+    # Image.gz followed by dtb.img; building it here keeps the flashable
+    # artefact identical whether or not make was asked for it.
+    DTB_SIZE="$(stat -c%s "$BOOT_DIR/dtb.img")"
+    (( DTB_SIZE > 0 )) || die "$BOOT_DIR/dtb.img is empty"
+    DTB_BLOB="$(mktemp)"
+    cp "$BOOT_DIR/dtb.img" "$DTB_BLOB"
+    fdt_magic="$(od -An -tx1 -N4 "$DTB_BLOB" | tr -d ' \n')"
+    [[ "$fdt_magic" == "d00dfeed" ]] \
+        || die "dtb.img does not start with an FDT magic ($fdt_magic)"
+    ok "dtb blob: ${DTB_SIZE} bytes (from dtb.img; Image.gz-dtb will be created)"
 fi
 
 # --------------------------------------------------------- 3. diagnostics ---
@@ -253,7 +271,7 @@ if [[ -n "$DTB_BLOB" ]]; then
     gzip -n -f -9 < "$BOOT_DIR/Image" > "$BOOT_DIR/Image.gz"
     cat "$BOOT_DIR/Image.gz" "$DTB_BLOB" > "$BOOT_DIR/Image.gz-dtb"
     rm -f "$DTB_BLOB"
-    ok "Image.gz-dtb rebuilt ($(stat -c%s "$BOOT_DIR/Image.gz-dtb") bytes)"
+    ok "Image.gz-dtb written ($(stat -c%s "$BOOT_DIR/Image.gz-dtb") bytes)"
 else
     log "no Image.gz-dtb in this build; only Image was patched"
 fi
