@@ -94,13 +94,26 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   image and not just in the sources.
 - **Not boot-tested.**
 
-#### KPM and SELinux hide stay unsupported (by construction, not by omission)
+#### KPM enabled (UNTESTED)
 
-- **KPM** is only a bridge: `sukisu_kpm_bridge()` calls KernelPatch's supercall through
-  `__arm64_sys_truncate`, and `.kpm` modules are loaded by KernelPatch. `CONFIG_KPM=y` alone
-  changes nothing — the probe fails, the manager keeps the panel "Unsupported", and KernelPatch's
-  own LKM builds target 5.10-6.18. Integrating KernelPatch into a 4.14 clang-LTO tree is a
-  separate, invasive project, so it is not attempted here.
+- KPM is SukiSU-Nova's bridge plus KernelPatch's loader: `sukisu_kpm_bridge()` calls the truncate
+  syscall handler with three magic words, and KernelPatch answers. `CONFIG_KPM=y` alone therefore
+  did nothing before — the probe returned `-EOPNOTSUPP` and the manager kept the panel disabled.
+- Three 4.14 ports were needed for the bridge and the KPM sources to compile on this tree:
+  `access_ok()`'s pre-5.0 signature; `task_struct::pids[PIDTYPE_PID].pid`, which this vendor tree
+  does not have because it already carries the 4.19 `thread_pid`/`pid_links` layout (the clone
+  Makefile now probes `include/linux/sched.h` for it, like its other vendor-backport probes); and
+  the truncate handler lookup, since `__arm64_sys_*` wrappers only exist from 4.17 — the bridge
+  now falls back to `sys_call_table[__NR_truncate]`, then `sys_truncate`/`SyS_truncate`.
+- New [`scripts/kpm-patch.sh`](scripts/kpm-patch.sh) does the half that is not in the kernel: it
+  runs ShirkNeko's `patch_linux` (pinned SukiSU_patch commit) on the built `Image` and rebuilds
+  `Image.gz-dtb` as `gzip(patched Image) + the original dtb blob`, then verifies the header magic,
+  the KernelPatch marker and that `Image.gz` decompresses to the patched image.
+- The workflow runs it after the build and before packaging, and asserts `CONFIG_KPM=y` and
+  `CONFIG_KALLSYMS_ALL=y` survived `olddefconfig`.
+
+#### SELinux hide stays unsupported (by construction, not by omission)
+
 - **SELinux hide** (`selinux_hide`, what the settings screen calls "Hide SELinux modification")
   reimplements selinuxfs against `struct selinux_policy` and other 5.6+ SELinux internals, and
   its init call is `#if`d at 5.10. This tree has `struct selinux_state` backported but no

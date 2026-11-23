@@ -78,12 +78,15 @@ clone). Then build as usual and confirm the config survived:
 ```sh
 ./scripts/build.sh --clang-dir <clang>/bin --no-polly
 grep -x 'CONFIG_KSU=y' out/.config     # must be =y, not dropped
-grep -x '# CONFIG_KPM is not set' out/.config
+grep -x 'CONFIG_KPM=y' out/.config
+./scripts/kpm-patch.sh              # inject KernelPatch; KPM needs this
 ```
 
 `CONFIG_KSU` is silently dropped by `olddefconfig` if a dependency is unmet, which is why the CI
-workflow asserts it explicitly. SUSFS and KPM are not part of this flavour; the reasoning and the
-hook table are in [`KSU-NOVA.md`](KSU-NOVA.md).
+workflow asserts it explicitly. SUSFS is not part of this flavour. KPM is, but only half of it
+lives in the kernel: `scripts/kpm-patch.sh` injects KernelPatch into the built image after the
+build, and must run before packaging. The reasoning, the hook table and the KPM caveats are in
+[`KSU-NOVA.md`](KSU-NOVA.md).
 
 ## 4. Manual equivalent
 

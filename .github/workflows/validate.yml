@@ -104,7 +104,7 @@ jobs:
             echo "::error::SUSFS is enabled in a build that must not have it"; exit 1
           fi
           grep -qx 'CONFIG_KSU=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
-          grep -qx '# CONFIG_KPM is not set' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -qx 'CONFIG_KPM=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
           # 4.14 ports of upstream-5.10-only code must actually be applied.
           grep -q 'KERNEL_VERSION(4, 14, 0)' KernelSU/kernel/kernel_compat.h \
             || { echo "::error::cpu_spoof gate is not lowered to 4.14"; exit 1; }
@@ -113,6 +113,16 @@ jobs:
           grep -q '< KERNEL_VERSION(4, 18, 0)' KernelSU/kernel/extension/cpu_spoof.c \
             || { echo "::error::cpu_spoof lost its pre-4.18 vDSO guard"; exit 1; }
           echo "cpu_spoof ported to 4.14"
+          # KPM: enabled in the defconfig and its three 4.14 ports applied.
+          grep -qx 'CONFIG_KPM=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig \
+            || { echo "::error::defconfig does not enable CONFIG_KPM"; exit 1; }
+          grep -q 'VERIFY_WRITE' KernelSU/kernel/extension/kpm/kpm.c \
+            || { echo "::error::KPM lost its pre-5.0 access_ok() form"; exit 1; }
+          grep -q 'KSU_TASK_HAS_THREAD_PID' KernelSU/kernel/Makefile \
+            || { echo "::error::the clone Makefile does not define KSU_TASK_HAS_THREAD_PID"; exit 1; }
+          test -x scripts/kpm-patch.sh \
+            || { echo "::error::scripts/kpm-patch.sh missing or not executable"; exit 1; }
+          echo "KPM enabled and ported"
           echo "integration applied as expected"
 
       - name: Re-run is read-only

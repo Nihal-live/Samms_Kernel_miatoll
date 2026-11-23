@@ -192,8 +192,9 @@ ok "drivers/Makefile + drivers/Kconfig wired"
 
 # ------------------------------------------- 3. SukiSU-Nova 4.14 fixes -------
 #
-# Four upstream conditionals are wrong for 4.14. Each edit is guarded so that
-# this step fails loudly when upstream rewrites the surrounding code.
+# Five upstream conditionals are wrong for 4.14, and KPM's 5.10 assumptions are
+# ported rather than avoided. Each edit is guarded so that this step fails
+# loudly when upstream rewrites the surrounding code.
 
 if [[ "$MODE" != check ]]; then
     python3 - "$KSU_DIR/kernel/kernel_includes.h" <<'PY'
@@ -226,21 +227,21 @@ import sys
 path = sys.argv[1]
 src = open(path).read()
 
-want = ("#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+want = ("#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)\n"
         "#define KSU_CAN_USE_KPM\n"
         "#endif\n")
-old = ("#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)\n"
-       "#define KSU_CAN_USE_KPM\n"
-       "#endif\n")
+raised = ("#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+          "#define KSU_CAN_USE_KPM\n"
+          "#endif\n")
 
-if want in src:
-    print("[ksu-nova]   KPM guard already >= 5.10")
-elif old in src:
-    # KPM needs 5.10+ interfaces (task_struct::pids, set_memory.h, ...). The
-    # 4.4 guard drags them into 4.14 and fails to compile, so raise it. KPM
-    # stays off; this only makes the dead code actually dead.
-    open(path, "w").write(src.replace(old, want, 1))
-    print("[ksu-nova]   raised KPM guard from 4.4.0 to 5.10.0")
+if raised in src:
+    # An earlier version of this script raised the guard to 5.10 to keep KPM's
+    # dead code dead. KPM is wanted now, and section 3.4 makes it compile on
+    # 4.14, so put upstream's guard back.
+    open(path, "w").write(src.replace(raised, want, 1))
+    print("[ksu-nova]   KPM guard restored to 4.4.0")
+elif want in src:
+    print("[ksu-nova]   KPM guard already >= 4.4")
 else:
     sys.exit("[ksu-nova] ERROR: KPM guard anchor missing in " + path
              + " (upstream changed)")
@@ -248,6 +249,172 @@ PY
 fi
 
 grep -q 'KSU_CAN_USE_KPM' "$KSU_DIR/kernel/kernel_compat.h" || die "KPM guard vanished"
+
+# -- 3.4 KPM on 4.14 ---------------------------------------------------------
+#
+# With the guard back at 4.4 the KPM sources are compiled on 4.14, and three
+# of them assume newer kernels. Each is a real port, not a bypass:
+#
+#   * access_ok() lost its access-type argument in 5.0.
+#   * struct task_struct lost `pids[PIDTYPE_PID].pid` in 4.19 in favour of
+#     thread_pid. This vendor tree already carries the 4.19 layout on 4.14, so
+#     the version test picks the wrong member; the KernelSU Makefile probes the
+#     header and defines KSU_TASK_HAS_THREAD_PID, exactly like the other
+#     vendor-backport probes it already has.
+#   * the KPM bridge calls KernelPatch's supercall through the truncate syscall
+#     handler. `__arm64_sys_*` wrappers only exist from 4.17, so on 4.14 the
+#     bridge has to reach the same function through sys_call_table
+#     (__NR_truncate) or the sys_truncate symbol.
+
+if [[ "$MODE" != check ]]; then
+    python3 - "$KSU_DIR/kernel/extension/kpm/kpm.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+src = once(
+    src,
+    "    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;\n",
+
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)\n"
+    "    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;\n"
+    "#else\n"
+    "    /* access_ok() takes the access type before 5.0. */\n"
+    "    if (!access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code),\n"
+    "                   sizeof(result)))\n"
+    "        return -EFAULT;\n"
+    "#endif\n",
+    "ported access_ok() to the pre-5.0 form")
+
+src = once(
+    src,
+    "        if (!fn) fn = (handler_t)find_kernel_symbol_exact(\"__arm64_sys_truncate.cfi\");\n"
+    "        if (!fn) return -EOPNOTSUPP;\n",
+
+    "        if (!fn) fn = (handler_t)find_kernel_symbol_exact(\"__arm64_sys_truncate.cfi\");\n"
+    "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)\n"
+    "        /*\n"
+    "         * 4.14 has no __arm64_sys_* wrappers. Resolve the truncate\n"
+    "         * handler the way this kernel exposes it: through\n"
+    "         * sys_call_table (so a hook installed at the table level is\n"
+    "         * still reached even if the function body was not patched),\n"
+    "         * then through the plain symbol.\n"
+    "         */\n"
+    "        if (!fn) {\n"
+    "            unsigned long *table = (unsigned long *)\n"
+    "                find_kernel_symbol_exact(\"sys_call_table\");\n"
+    "            if (table && table[__NR_truncate])\n"
+    "                fn = (handler_t)table[__NR_truncate];\n"
+    "        }\n"
+    "        if (!fn) fn = (handler_t)find_kernel_symbol_exact(\"sys_truncate\");\n"
+    "        if (!fn) fn = (handler_t)find_kernel_symbol_exact(\"SyS_truncate\");\n"
+    "#endif\n"
+    "        if (!fn) return -EOPNOTSUPP;\n",
+    "added the pre-4.17 truncate-handler lookup")
+
+# __NR_truncate is spelled __NR3264_truncate on arm64 and may not be visible
+# here at all; define it once, right before the ARM64 block that uses it.
+if "SUKISU_KPM_NR_TRUNCATE_GUARD" not in src:
+    anchor = "#ifdef CONFIG_ARM64\n#include <asm/ptrace.h>\n#endif\n"
+    if anchor not in src:
+        sys.exit("[ksu-nova] ERROR: arm64 include anchor missing in " + path
+                 + " (upstream changed)")
+    src = src.replace(
+        anchor,
+        anchor +
+        "\n/* SUKISU_KPM_NR_TRUNCATE_GUARD: the syscall number of truncate as\n"
+        " * this kernel spells it. arm64 calls it __NR3264_truncate. */\n"
+        "#ifndef __NR_truncate\n"
+        "#ifdef __NR3264_truncate\n"
+        "#define __NR_truncate __NR3264_truncate\n"
+        "#else\n"
+        "#define __NR_truncate 45\n"
+        "#endif\n"
+        "#endif\n",
+        1)
+    print("[ksu-nova]   defined __NR_truncate for arm64")
+else:
+    print("[ksu-nova]   __NR_truncate guard: already applied")
+
+open(path, "w").write(src)
+PY
+
+    python3 - "$KSU_DIR/kernel/extension/kpm/super_access.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+old = ("#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)\n"
+       "DEFINE_MEMBER(task_struct, pids[PIDTYPE_PID].pid)\n"
+       "#else\n"
+       "DEFINE_MEMBER(task_struct, thread_pid)\n"
+       "#endif\n")
+new = ("#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0) && \\\n"
+       "    !defined(KSU_TASK_HAS_THREAD_PID)\n"
+       "DEFINE_MEMBER(task_struct, pids[PIDTYPE_PID].pid)\n"
+       "#else\n"
+       "DEFINE_MEMBER(task_struct, thread_pid)\n"
+       "#endif\n")
+
+if new in src:
+    print("[ksu-nova]   task_struct pid member: already applied")
+elif old in src:
+    open(path, "w").write(src.replace(old, new, 1))
+    print("[ksu-nova]   task_struct pid member honours KSU_TASK_HAS_THREAD_PID")
+else:
+    sys.exit("[ksu-nova] ERROR: task_struct pid member anchor missing in "
+             + path + " (upstream changed)")
+PY
+
+    python3 - "$KSU_DIR/kernel/Makefile" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+block = """
+# Some 4.x trees carry the 4.19 struct task_struct (thread_pid/pid_links)
+# backported, so task_struct::pids is gone even though LINUX_VERSION_CODE still
+# says 4.14. Probe the header instead of trusting the version, the same way the
+# selinux/seccomp probes above do.
+ifeq ($(shell grep -q 'struct pid[[:space:]]*\*thread_pid' $(srctree)/include/linux/sched.h; echo $$?),0)
+ccflags-y += -DKSU_TASK_HAS_THREAD_PID
+endif
+"""
+
+if "KSU_TASK_HAS_THREAD_PID" in src:
+    print("[ksu-nova]   KSU_TASK_HAS_THREAD_PID probe: already present")
+else:
+    anchor = "# Check new vfs_getattr()\n"
+    if anchor not in src:
+        sys.exit("[ksu-nova] ERROR: vfs_getattr probe anchor missing in "
+                 + path + " (upstream changed)")
+    open(path, "w").write(src.replace(anchor, block.lstrip("\n") + "\n" + anchor, 1))
+    print("[ksu-nova]   added KSU_TASK_HAS_THREAD_PID probe to the clone Makefile")
+PY
+fi
+
+grep -q 'KSU_CAN_USE_KPM' "$KSU_DIR/kernel/kernel_compat.h" || die "KPM gate vanished"
+grep -q 'VERIFY_WRITE' "$KSU_DIR/kernel/extension/kpm/kpm.c" \
+    || die "KPM lost its pre-5.0 access_ok() form"
+grep -q 'SUKISU_KPM_NR_TRUNCATE_GUARD' "$KSU_DIR/kernel/extension/kpm/kpm.c" \
+    || die "KPM lost the arm64 truncate syscall number"
+grep -q 'KSU_TASK_HAS_THREAD_PID' "$KSU_DIR/kernel/extension/kpm/super_access.c" \
+    || die "super_access.c does not honour KSU_TASK_HAS_THREAD_PID"
+grep -q 'KSU_TASK_HAS_THREAD_PID' "$KSU_DIR/kernel/Makefile" \
+    || die "the clone Makefile does not define KSU_TASK_HAS_THREAD_PID"
 
 # -- 3.3 CPU identity spoofing on 4.14 ---------------------------------------
 #
@@ -729,11 +896,11 @@ if has_config("KSU_FEATURE_ADBROOT"):
 # module list and the ksud paths degrade.
 wanted += ["CONFIG_KALLSYMS=y", "CONFIG_KALLSYMS_ALL=y"]
 
-# KPM is deliberately off: its own Kconfig help says it "may affect system
-# stability", it needs 5.10+ interfaces, and loading arbitrary LKMs is the one
-# KernelSU feature with a real bootloop footprint. Setting it to n explicitly
-# also documents that the choice was made on purpose.
-wanted += ["# CONFIG_KPM is not set"]
+# KPM is on. It is the one feature that loads third-party code into the kernel,
+# so its Kconfig help warns about stability, and it only works when the image
+# is post-processed by KernelPatch's patch_linux (the workflow does that). The
+# 4.14 ports it needs are applied in section 3.4.
+wanted += ["CONFIG_KPM=y"]
 
 # SukiSU-Nova declares `CONFIG_KSU_SUSFS` default y, depending only on KSU and
 # THREAD_INFO_IN_TASK. Leaving it unset selects it, and then its fs/mm/security
@@ -780,7 +947,7 @@ if grep -q '^config KSU_FEATURE_ADBROOT' "$KSU_DIR/kernel/Kconfig"; then
     grep -qx 'CONFIG_KSU_FEATURE_ADBROOT=y' "$DEFCONFIG" \
         || die "defconfig missing CONFIG_KSU_FEATURE_ADBROOT=y"
 fi
-grep -qx '# CONFIG_KPM is not set' "$DEFCONFIG" || die "defconfig must keep KPM off"
+grep -qx 'CONFIG_KPM=y' "$DEFCONFIG" || die "defconfig must set CONFIG_KPM=y"
 if grep -qE '^CONFIG_KSU_SUSFS' "$DEFCONFIG"; then
     die "stale CONFIG_KSU_SUSFS* symbol in defconfig"
 fi
@@ -788,7 +955,7 @@ if grep -q '^config KSU_SUSFS' "$KSU_DIR/kernel/Kconfig"; then
     grep -qx '# CONFIG_KSU_SUSFS is not set' "$DEFCONFIG" \
         || die "defconfig must switch CONFIG_KSU_SUSFS off (upstream default is y)"
 fi
-ok "defconfig: CONFIG_KSU=y, ADB root on, KPM off, no SUSFS symbols"
+ok "defconfig: CONFIG_KSU=y, ADB root on, KPM on, no SUSFS symbols"
 
 # ------------------------------------------------------------- 6. checklist ---
 
@@ -802,9 +969,11 @@ cat <<EOF
 [ksu-nova]   SukiSU-Nova : ${HEAD_SHA:-unknown}
 [ksu-nova]   defconfig   : $DEFCONFIG
 [ksu-nova]   features    : su compat, kernel umount, sulog, adb root,
-[ksu-nova]                 shell su adb only, mount hide, cpu identity spoof
+[ksu-nova]                 shell su adb only, mount hide, cpu identity spoof,
+[ksu-nova]                 KPM (CONFIG_KPM=y; the built Image must still be
+[ksu-nova]                 post-processed by KernelPatch's patch_linux)
 [ksu-nova]                 (manager-toggled; compiled in unconditionally)
-[ksu-nova]   not included: SUSFS, KPM (needs KernelPatch), selinux hide (5.10+),
+[ksu-nova]   not included: SUSFS, selinux hide (needs 5.6+ SELinux internals),
 [ksu-nova]                 AVC log spoofing (SUSFS-only)
 [ksu-nova]   next        : scripts/build.sh --clang-dir <clang>/bin
 [ksu-nova]   note        : CONFIG_KSU must still be =y in out/.config after

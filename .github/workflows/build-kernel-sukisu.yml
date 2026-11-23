@@ -11,7 +11,8 @@ name: Build SKYNET kernel + SukiSU-Nova root (AnyKernel3 ZIP)
 #                                the four 4.14 hook call sites, the two Nova
 #                                4.14 fixes, and the CONFIG_KSU* symbols
 #
-# No SUSFS and no KPM in this flavour -- see docs/KSU-NOVA.md for why.
+# No SUSFS in this flavour; KPM is on and gets a KernelPatch image patch.
+# See docs/KSU-NOVA.md.
 #
 # The build is untested on hardware: the job proves it compiles and that
 # CONFIG_KSU actually survived into .config -- not that the resulting kernel
@@ -158,8 +159,20 @@ jobs:
           grep -q '>= KERNEL_VERSION(4, 20, 0)' KernelSU/kernel/extension/cpu_spoof.c \
             || { echo "::error::cpu_spoof lost its elf_hwcap2 guard"; exit 1; }
           echo "cpu_spoof ported to 4.14"
+          echo "--- KPM 4.14 ports ---"
+          grep -q 'VERIFY_WRITE' KernelSU/kernel/extension/kpm/kpm.c \
+            || { echo "::error::KPM lost its pre-5.0 access_ok() form"; exit 1; }
+          grep -q 'SUKISU_KPM_NR_TRUNCATE_GUARD' KernelSU/kernel/extension/kpm/kpm.c \
+            || { echo "::error::KPM lost the arm64 truncate syscall number"; exit 1; }
+          grep -q 'KSU_TASK_HAS_THREAD_PID' KernelSU/kernel/extension/kpm/super_access.c \
+            || { echo "::error::super_access.c ignores KSU_TASK_HAS_THREAD_PID"; exit 1; }
+          grep -q 'KSU_TASK_HAS_THREAD_PID' KernelSU/kernel/Makefile \
+            || { echo "::error::the clone Makefile does not define KSU_TASK_HAS_THREAD_PID"; exit 1; }
+          grep -qx 'CONFIG_KPM=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig \
+            || { echo "::error::defconfig does not enable CONFIG_KPM"; exit 1; }
+          echo "KPM ports in place"
           echo "--- defconfig ---"
-          grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS|^# CONFIG_KPM' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS|^CONFIG_KPM' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 
       - name: Verify in-tree source
         run: ./scripts/verify-source.sh
@@ -202,13 +215,17 @@ jobs:
               echo "::error::defconfig symbol $sym was dropped from .config"; exit 1; }
           done < <(grep -E '^CONFIG_KSU[A-Z_0-9]*=y$' \
                      arch/arm64/configs/vendor/xiaomi/miatoll_defconfig)
-          if grep -qx 'CONFIG_KPM=y' out/.config; then
-            echo "::error::KPM must stay off on 4.14"; exit 1
-          fi
+          # KPM is on now, and the post-build step below is what makes it work.
+          # An option whose dependency is unmet is dropped silently, so a
+          # missing CONFIG_KPM=y would ship a kernel whose KPM panel is dead.
+          grep -qx 'CONFIG_KPM=y' out/.config \
+            || { echo "::error::CONFIG_KPM=y did not survive olddefconfig"; exit 1; }
+          grep -qx 'CONFIG_KALLSYMS_ALL=y' out/.config \
+            || { echo "::error::KPM needs CONFIG_KALLSYMS_ALL=y"; exit 1; }
           if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
             echo "::error::SUSFS symbols found but SUSFS is not part of this build"; exit 1
           fi
-          echo "CONFIG_KSU survived; KPM off; no SUSFS symbols"
+          echo "CONFIG_KSU and CONFIG_KPM survived; no SUSFS symbols"
 
           echo "--- kernel.release ---"
           REL="$(cat out/include/config/kernel.release 2>/dev/null || printf 'unknown')"
@@ -223,6 +240,25 @@ jobs:
           strings out/vmlinux | grep -qx 'cpu_spoof' || {
             echo "::error::cpu_spoof extension is not in vmlinux"; exit 1; }
           echo "cpu_spoof extension present in vmlinux"
+
+      - name: Patch image for KPM (KernelPatch)
+        # CONFIG_KPM only compiles SukiSU's *bridge*; the loader is
+        # KernelPatch, which has to be injected into the built image. This runs
+        # patch_linux and rebuilds Image.gz-dtb around the patched Image.
+        run: ./scripts/kpm-patch.sh
+
+      - name: Verify KPM patch
+        run: |
+          set -euo pipefail
+          BOOT=out/arch/arm64/boot
+          strings "$BOOT/Image" | grep -q 'KernelPatch Version' \
+            || { echo "::error::Image does not carry KernelPatch after patching"; exit 1; }
+          echo "patched Image: $(stat -c%s "$BOOT/Image") bytes"
+          echo "Image.gz-dtb : $(stat -c%s "$BOOT/Image.gz-dtb") bytes"
+          ls -lh "$BOOT" | head -20
+
+      - name: Boot artefacts
+        run: |
           echo "--- boot artefacts ---"
           ls -lh out/arch/arm64/boot/ || true
 

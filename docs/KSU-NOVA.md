@@ -7,8 +7,10 @@ integration is applied from a clean checkout by
 
 - **No SUSFS.** Root hiding is not part of this build. See
   [Why no SUSFS](#why-no-susfs).
-- **No KPM.** Kernel module (LKM) loading is off — it is a bridge to
-  KernelPatch, which is not part of this kernel. See [Feature matrix](#feature-matrix).
+- **KPM: on, with a post-build step.** SukiSU's KPM is only a bridge;
+  [KernelPatch](https://github.com/bmax121/KernelPatch) provides the loader and
+  is injected into the built image by `scripts/kpm-patch.sh`. See
+  [KPM](#kpm).
 
 ## What gets installed
 
@@ -21,17 +23,17 @@ tree:
 2. **Wire the module** — `drivers/kernelsu` symlink, `drivers/Makefile` rule and
    `drivers/Kconfig` source line. A stale `CONFIG_WITH_KERNEL_SU` guard left by
    an earlier setup script is normalised to `CONFIG_KSU`.
-3. **Apply four 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
-   exist before 5.10), raise the KPM guard from 4.4 to 5.10 so KPM's dead code
-   is actually dead, lower the CPU-spoof guard from 5.10 to 4.14, and compile
-   the parts of `cpu_spoof.c` that assume a 4.18+ vDSO out of the build. See
+3. **Apply the 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
+   exist before 5.10), port KPM's three 5.10 assumptions (see [KPM](#kpm)),
+   lower the CPU-spoof guard from 5.10 to 4.14 and compile the parts of
+   `cpu_spoof.c` that assume a 4.18+ vDSO out of the build. See
    [CPU identity spoofing](#cpu-identity-spoofing).
 4. **Insert the manual hook call sites** a 4.14 kernel needs — see
    [Hooks](#hooks).
 5. **Inject the defconfig symbols** — `CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
-   `CONFIG_KALLSYMS_ALL`, plus explicit `# CONFIG_KPM is not set` and
-   `# CONFIG_KSU_SUSFS is not set`. Both of the latter default to *on* upstream,
-   so "not mentioned" is not the same as "off".
+   `CONFIG_KALLSYMS_ALL`, `CONFIG_KPM=y`, plus explicit
+   `# CONFIG_KSU_SUSFS is not set` (SUSFS defaults to *on* upstream, so "not
+   mentioned" is not the same as "off").
 
 Nothing is committed pre-applied: `git status` on a fresh checkout is clean.
 
@@ -53,9 +55,53 @@ compiled in unconditionally; only ADB root and KPM have Kconfig switches.
 | App profile / allowlist / manager tracking | yes | |
 | CPU identity spoofing | yes | MIDR + BogoMIPS + ELF `hwcap`; see [CPU identity spoofing](#cpu-identity-spoofing) |
 | Extensions (version spoof, dynamic manager, unmount paths) | yes | |
-| **KPM** (load external kernel modules) | **no** | SukiSU's KPM is only a bridge: it calls KernelPatch's supercall on `__arm64_sys_truncate`. Without KernelPatch in the kernel the probe fails and the manager keeps KPM "Unsupported" even with `CONFIG_KPM=y`. KernelPatch's own LKM builds target 5.10-6.18. |
+| **KPM** (load external kernel modules) | **yes, needs the image patch** | `CONFIG_KPM=y` compiles SukiSU's bridge; `scripts/kpm-patch.sh` injects KernelPatch into the image. See [KPM](#kpm). |
 | **AVC log spoofing** | **no** | SUSFS-only (`susfs_set_avc_log_spoofing()`) |
 | **SUSFS** | **no** | see below |
+
+## KPM
+
+KPM lets the manager load `.kpm` modules — compiled kernel code — at runtime.
+It needs two halves, and only one of them is a Kconfig switch:
+
+1. **The bridge** (SukiSU-Nova, `CONFIG_KPM=y`). `sukisu_kpm_bridge()` builds a
+   fake `pt_regs` with three magic words and calls the kernel's truncate
+   syscall handler. If the handler answers with `SUKISU_KPM_ABI_VERSION`, the
+   bridge forwards the real op. Without KernelPatch it simply returns
+   `-EOPNOTSUPP`, which is why `CONFIG_KPM=y` on its own changes nothing.
+2. **The loader** (KernelPatch). `scripts/kpm-patch.sh` runs `patch_linux` from
+   ShirkNeko's [SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch) on the
+   built `Image` and rebuilds `Image.gz-dtb` around the patched result.
+
+### The 4.14 ports
+
+With upstream's `KSU_CAN_USE_KPM` guard (>= 4.4) the KPM sources compile on
+4.14, but three of them assume newer kernels:
+
+| Assumption | 4.14 reality | What the script does |
+| --- | --- | --- |
+| `access_ok(addr, size)` | takes the access type first until 5.0 | `VERIFY_WRITE` form below 5.0 |
+| `task_struct::pids[PIDTYPE_PID].pid` | this vendor tree already carries the 4.19 `thread_pid` layout | the Makefile probes `include/linux/sched.h` and defines `KSU_TASK_HAS_THREAD_PID`, like its other vendor-backport probes |
+| `__arm64_sys_truncate` | `__arm64_sys_*` wrappers only exist from 4.17 | falls back to `sys_call_table[__NR_truncate]`, then `sys_truncate` / `SyS_truncate` |
+
+The syscall-table lookup is deliberate: it reaches KernelPatch whether it hooks
+the table entry or the function body.
+
+### What can still go wrong
+
+- **KernelPatch has to accept the image.** It is a binary patcher, so it parses
+  the kernel's `_stext`/kallsyms rather than source. kpimg reports
+  `3.18 - 6.6 (theoretically)`; this 4.14 image is at the old end of that claim
+  and is the one part of this integration that cannot be verified without
+  booting. `scripts/kpm-patch.sh` refuses to continue if `patch_linux` fails or
+  if the result no longer looks like an arm64 Image, so a bad patch fails the
+  build instead of producing a zip.
+- **`.kpm` modules must be built for 4.14 arm64.** A module built against a 5.x
+  kernel will not load, and a broken module is the one thing that can panic the
+  device. Flash with a boot backup.
+- **KPM widens the attack surface by design**: it executes third-party code in
+  kernel context. That is the feature, not a bug, but it is why it is the only
+  thing in this build that its own Kconfig calls "may affect system stability".
 
 ## CPU identity spoofing
 
@@ -155,7 +201,7 @@ serves the legacy syscall-su path this ref does not use.
    because no SUSFS code is compiled.
 5. **KPM on a 4.14 tree.** Its `KSU_CAN_USE_KPM` guard says 4.4, which drags in
    5.10 interfaces (`task_struct::pids`, `set_memory.h`). The script raises the
-   guard and the defconfig keeps KPM off.
+   guard; that section now ports those interfaces instead of hiding them.
 6. **`path_umount()` before 5.9.** Nova ships a `__weak` shim
    (`kernel/kernel_compat.c`) built on `d_path()` + `sys_umount()`; it links and
    works for the kernel-umount feature. It is a shim, not the 5.9 implementation.
