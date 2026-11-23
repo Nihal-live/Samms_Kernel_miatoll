@@ -117,8 +117,15 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   whose KPM panel could never have worked.
 - The workflow runs it after the build and before packaging, and asserts `CONFIG_KPM=y` and
   `CONFIG_KALLSYMS_ALL=y` survived `olddefconfig`.
-- The step is also carried into the KernelSU_Action_V2 pipeline, which delegates to the same
-  script; see `ci/ksu-action-v2/`.
+- Built in CI, twice, from the same commit: run
+  [`45101070470`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45101070470)
+  (this repo's workflow, 16m38s, `skynet-kernel-sukisu-nova-zip`, 39.2 MB) and run
+  [`45101073164`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45101073164)
+  (KernelSU_Action_V2's scripts, 20m51s). Both assert the payload magic in the packaged
+  `Image`, `CONFIG_KPM=y` in `out/.config` and that `Image.gz` decompresses to it; the KPM log
+  shows `kpimg version: e00`, `config: android,release` and `Image 43190288 -> 43486832 bytes`.
+- **Not boot-tested.** KernelPatch accepts and patches this 4.14 image, which is the last thing
+  a build can prove; whether the loader starts on the device is not something CI can answer.
 
 #### SELinux hide stays unsupported (by construction, not by omission)
 

@@ -198,11 +198,21 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Zip the AnyKernel3 package
+        # package.sh assembles AnyKernel3/ but leaves it unpacked; a flashable
+        # zip is what a phone wants.
+        run: |
+          set -euo pipefail
+          AK3="$WORKSPACE/AnyKernel3"
+          [ -d "$AK3" ] || { echo "no AnyKernel3 directory was assembled"; exit 0; }
+          ( cd "$AK3" && zip -qr "$WORKSPACE/AnyKernel3-${{ steps.meta.outputs.device }}.zip" . )
+          ls -l "$WORKSPACE/AnyKernel3-${{ steps.meta.outputs.device }}.zip"
+
       - name: Upload AnyKernel3 ZIP
         uses: actions/upload-artifact@v4
         with:
           name: ksu-action-AnyKernel3-${{ steps.meta.outputs.device }}-${{ steps.meta.outputs.build_time }}
-          path: ${{ github.workspace }}/kernel_workspace/*.zip
+          path: ${{ github.workspace }}/kernel_workspace/AnyKernel3-*.zip
           if-no-files-found: warn
           retention-days: 14
 
