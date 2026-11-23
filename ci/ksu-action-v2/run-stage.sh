@@ -28,12 +28,27 @@ rc=${PIPESTATUS[0]}
 printf '=== finished: %s (rc=%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rc" | tee -a "$log"
 
 if [ "$rc" -ne 0 ]; then
-	# GitHub annotations survive even when the log cannot be downloaded.
-	grep -nE 'error:|\bx\]|undefined reference|No rule to make|\*{3}|Error [0-9]+$' "$log" |
-		head -20 |
-		while IFS= read -r line; do
-			echo "::error::${stage}: ${line//%/}"
-		done
+	# GitHub annotations survive even when the log cannot be downloaded, and
+	# they are the only channel that does: the job log endpoint is unreachable
+	# from some clients, and the artefact zip is served from blob storage.
+	#
+	# Matched error lines first; if the stage failed without anything that
+	# looks like an error (make's "$(error ...)" text, for example, is a bare
+	# sentence ending in "Stop."), fall back to the tail, which is where make
+	# prints it.
+	matched=$(grep -nE 'error:|\bx\]|undefined reference|No rule to make|\*{3}|Stop\.|Error [0-9]+$' "$log" | head -20)
+	if [ -n "$matched" ]; then
+		printf '%s\n' "$matched" |
+			while IFS= read -r line; do
+				echo "::error::${stage}: ${line//%/}"
+			done
+	else
+		tail -n 15 "$log" |
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				echo "::error::${stage} (tail): ${line//%/}"
+			done
+	fi
 fi
 
 exit "$rc"
