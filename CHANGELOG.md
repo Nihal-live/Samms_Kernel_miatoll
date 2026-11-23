@@ -88,6 +88,10 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   this tree's headers: 0 errors, `cpu_spoof` handler and name string present, and the
   preprocessed output contains no `vdso_time_data`, no `vdso_data_ptr` and no
   `clear_bit(ARM64_WORKAROUND_1418040`.
+- Built in CI: run [`45093146525`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45093146525)
+  (commit `bb4434ac6`), 13m43s, artifact `skynet-kernel-sukisu-nova-zip` (38.1 MB). That run also
+  asserts `strings vmlinux` contains the `cpu_spoof` handler name, so the extension is in the
+  image and not just in the sources.
 - **Not boot-tested.**
 
 #### KPM and SELinux hide stay unsupported (by construction, not by omission)
