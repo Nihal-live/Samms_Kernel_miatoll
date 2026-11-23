@@ -1,0 +1,282 @@
+diff --git a/.github/workflows/build-kernel.yml b/.github/workflows/build-kernel.yml
+index e324ce6..d558fa0 100644
+--- a/.github/workflows/build-kernel.yml
++++ b/.github/workflows/build-kernel.yml
+@@ -25,6 +25,7 @@ on:
+           - kernelsu
+           - kernelsu-next
+           - sukisu-ultra
++          - samms-nova
+           - resukisu
+           - rsuntk
+           - backslashxx
+diff --git a/config/miatoll.env b/config/miatoll.env
+new file mode 100644
+index 0000000..5762128
+--- /dev/null
++++ b/config/miatoll.env
+@@ -0,0 +1,96 @@
++# Build profile: Xiaomi Redmi Note 9 Pro / Poco M2 Pro (miatoll), SKYNET kernel.
++#
++#   Linux 4.14.357-openela, Clang + LLD, CONFIG_LOCALVERSION=-SKYNET
++#   SukiSU-Nova (builtin, pinned) integrated by the kernel tree itself
++#   KPM on, which means the image gets a KernelPatch post-build step
++#   No SUSFS (the tree does not ship it and it is not wanted here)
++#
++# Pick this file in "Config file to build" when starting a build.
++
++CONFIG_ENV=config/miatoll.env
++
++# ============================================================ Kernel source ==
++
++KERNEL_SOURCE=https://github.com/Nihal-live/Samms_Kernel_miatoll
++# Branch, not a tag: the KPM/cpu_spoof work is on it. Pin a commit if you want
++# a frozen build.
++KERNEL_SOURCE_BRANCH=arena/6930beb9-samms-kernel-miatoll
++KERNEL_CONFIG=vendor/xiaomi/miatoll_defconfig
++KERNEL_IMAGE_NAME=Image.gz-dtb
++ARCH=arm64
++
++KERNEL_NAME=miatoll
++ADD_LOCALVERSION_TO_FILENAME=true
++
++# LTO means Clang must also link and archive: lld and the LLVM binutils, not
++# the AOSP GCC ones. The tree's Makefile refuses to build when CROSS_COMPILE
++# ends in android- unless CLANG_TRIPLE names the real target triple, which is
++# why that goes in CUSTOM_CMDS. CONFIG_LLVM_POLLY has to go as well: the
++# prebuilt Clang has no Polly and the defconfig turns it on for LTO.
++CUSTOM_CMDS:CLANG_TRIPLE=aarch64-linux-gnu-
++EXTRA_CMDS:LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
++
++# =================================================================== Clang ===
++#
++# Same toolchain the tree's own workflow uses and that has produced working
++# images for it. AOSP r450784e also works but is much older than this tree's
++# LTO setup; if you switch, expect new warnings on 4.14 vendor code.
++CLANG_BRANCH=master
++CLANG_VERSION=
++USE_CUSTOM_CLANG=true
++CUSTOM_CLANG_SOURCE=https://github.com/kdrag0n/proton-clang.git
++CUSTOM_CLANG_BRANCH=master
++
++USE_LLVM=false
++ENABLE_GCC_ARM64=true
++ENABLE_GCC_ARM32=true
++
++# =============================================================== KernelSU ===
++#
++# samms-nova = SukiSU-Nova 'builtin', installed by the kernel tree's own
++# scripts/ksu-nova-setup.sh. That script owns the 4.14 hook call sites, the
++# KPM and cpu_spoof ports and the defconfig block, so KSU_HOOK_MODE is 'none':
++# anything else would patch the hooks a second time.
++KSU_VARIANT=samms-nova
++KSU_REF=4bec532dd447e2852aa8932afa768255350c103a
++KSU_HOOK_MODE=none
++
++# =================================================================== SUSFS ===
++
++ENABLE_SUSFS=false
++
++# ========================================================== Extra patches ===
++
++# SukiSU-Nova already has its own path_umount() shim for < 5.9; applying the
++# backport again would define it twice.
++ENABLE_PATH_UMOUNT=false
++ENABLE_HIDE_STUFF=false
++
++# Kernel Patch Module support. The kernel side is SukiSU's bridge
++# (CONFIG_KPM=y); the loader is KernelPatch, injected into the built image by
++# scripts/kpm-patch.sh. Only arm64.
++ENABLE_KPM=true
++
++# ================================================================ Kconfig ===
++
++ADD_KPROBES_CONFIG=false
++ADD_OVERLAYFS_CONFIG=true
++DISABLE_LTO=false
++DISABLE_CC_WERROR=false
++
++# Applied to the defconfig after the KernelSU block. Polly off: see above.
++EXTRA_DEFCONFIG=CONFIG_LLVM_POLLY=n
++
++# ============================================================= AnyKernel3 ===
++
++USE_CUSTOM_ANYKERNEL3=false
++
++# ============================================================== Packaging ===
++
++NEED_DTBO=false
++BUILD_BOOT_IMG=false
++
++# ================================================================= Runner ===
++
++ENABLE_CCACHE=true
++REMOVE_UNUSED_PACKAGES=true
+diff --git a/scripts/config.sh b/scripts/config.sh
+index b21b47c..880e7a6 100644
+--- a/scripts/config.sh
++++ b/scripts/config.sh
+@@ -194,7 +194,7 @@ validate() {
+ 	esac
+ 
+ 	case "${CFG[KSU_VARIANT]}" in
+-		none | kernelsu | kernelsu-next | sukisu-ultra | resukisu | rsuntk | backslashxx) ;;
++		none | kernelsu | kernelsu-next | sukisu-ultra | samms-nova | resukisu | rsuntk | backslashxx) ;;
+ 		*) _err "unknown KSU_VARIANT '${CFG[KSU_VARIANT]}'" ;;
+ 	esac
+ 
+@@ -207,13 +207,16 @@ validate() {
+ 		is_true "${CFG[ENABLE_SUSFS]}" &&
+ 			_err "ENABLE_SUSFS requires a KSU_VARIANT other than 'none'"
+ 		is_true "${CFG[ENABLE_KPM]}" &&
+-			_err "ENABLE_KPM requires KSU_VARIANT=sukisu-ultra"
++			_err "ENABLE_KPM requires KSU_VARIANT=sukisu-ultra or samms-nova"
+ 	fi
+ 
+-	# KPM is a SukiSU-Ultra feature and its patch_linux tool is 64-bit only.
++	# KPM needs a SukiSU fork whose kernel side speaks the KernelPatch
++	# supercall, and its patch_linux tool is 64-bit only.
+ 	if is_true "${CFG[ENABLE_KPM]}"; then
+-		[ "${CFG[KSU_VARIANT]}" = "sukisu-ultra" ] ||
+-			_err "ENABLE_KPM is only supported with KSU_VARIANT=sukisu-ultra (got '${CFG[KSU_VARIANT]}')"
++		case "${CFG[KSU_VARIANT]}" in
++			sukisu-ultra | samms-nova) ;;
++			*) _err "ENABLE_KPM is only supported with KSU_VARIANT=sukisu-ultra or samms-nova (got '${CFG[KSU_VARIANT]}')" ;;
++		esac
+ 		[ "${CFG[ARCH]}" = "arm64" ] ||
+ 			_err "ENABLE_KPM requires ARCH=arm64"
+ 	fi
+diff --git a/scripts/kernelsu.sh b/scripts/kernelsu.sh
+index 6ed0170..214b6ca 100644
+--- a/scripts/kernelsu.sh
++++ b/scripts/kernelsu.sh
+@@ -60,6 +60,14 @@ ksu_registry() {
+ 		echo "https://github.com/rsuntk/KernelSU|main|KernelSU|main|main|susfs-rksu-master|RKSU (rsuntk)" ;;
+ 	backslashxx)
+ 		echo "https://github.com/backslashxx/KernelSU|master|KernelSU|master|master|-|backslashxx KernelSU" ;;
++	samms-nova)
++		# SukiSU-Nova 'builtin' tree, integrated by the kernel tree itself:
++		# scripts/ksu-nova-setup.sh in the source repo owns the 4.14 hook call
++		# sites, the KPM and cpu_spoof ports and the defconfig block. A '-'
++		# repo means "the tree installs it" -- there is no kernel/setup.sh to
++		# fetch for this ref, and re-deriving the hook layout here would undo
++		# exactly the work that makes it link on 4.14.
++		echo "-|builtin|KernelSU|4bec532dd447e2852aa8932afa768255350c103a|4bec532dd447e2852aa8932afa768255350c103a|-|SukiSU-Nova (in-tree)" ;;
+ 	*)
+ 		die "unknown KSU_VARIANT '$1'" ;;
+ 	esac
+@@ -82,6 +90,12 @@ ksu_install() {
+ 	local repo setup_ref dir modern_ref legacy_ref susfs_refs name
+ 	IFS='|' read -r repo setup_ref dir modern_ref legacy_ref susfs_refs name <<<"$(ksu_registry "$variant")"
+ 
++	if [ "$repo" = "-" ]; then
++		ksu_install_in_tree "$variant" "$dir" "$name" \
++			"${requested_ref:-$legacy_ref}"
++		return 0
++	fi
++
+ 	group "Installing ${name}"
+ 	info "repository: ${repo}"
+ 
+@@ -193,6 +207,76 @@ ksu_install() {
+ 	endgroup
+ }
+ 
++# ------------------------------------------------- in-tree integration ---
++#
++# Some forks ship no setup.sh: the kernel tree itself carries the integration
++# (source-level hooks, ports for the kernel version, defconfig block). Running
++# the generic installer on top of that would be wrong twice over -- there is
++# nothing to fetch, and re-patching hooks that the tree already owns can land
++# them twice. So this path only *runs the tree's script* and then verifies what
++# it produced with the same checks the generic path uses.
++
++ksu_install_in_tree() {
++	local variant=$1 dir=$2 name=$3 ref=$4
++	local script="${KERNEL_DIR}/scripts/ksu-nova-setup.sh"
++
++	group "Installing ${name}"
++	[ -f "$script" ] || die "${variant} installs from the kernel tree, but
++       ${KERNEL_DIR}/scripts/ksu-nova-setup.sh does not exist.
++       Point KERNEL_SOURCE at the repo that carries it, or use a variant that
++       ships its own setup.sh."
++	info "running the in-tree integration: scripts/ksu-nova-setup.sh"
++
++	local kver
++	kver=$(kernel_version "$KERNEL_DIR" || echo "0.0")
++	info "kernel ${kver}; the in-tree script refuses anything but the version"
++	info "it was written for, so a mismatch fails here instead of at link time"
++
++	( cd "$KERNEL_DIR" && KSU_REF="$ref" bash scripts/ksu-nova-setup.sh ) \
++		|| die "${name} in-tree integration failed -- see its output above"
++
++	# --- verify what it claims to have done ---------------------------------
++	local ksu_dir="${KERNEL_DIR}/${dir}"
++	[ -d "$ksu_dir" ] || die "integration finished but ${dir}/ is missing"
++	[ -e "${KERNEL_DIR}/drivers/kernelsu" ] \
++		|| die "drivers/kernelsu symlink was not created"
++	grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/?[[:space:]]*$' \
++		"${KERNEL_DIR}/drivers/Makefile" \
++		|| die "drivers/Makefile was not wired to CONFIG_KSU for kernelsu"
++	grep -q 'drivers/kernelsu/Kconfig' "${KERNEL_DIR}/drivers/Kconfig" \
++		|| die "drivers/Kconfig was not wired up for kernelsu"
++
++	local head_sha head_desc
++	head_sha=$(git -C "$ksu_dir" rev-parse --short HEAD)
++	head_desc=$(git -C "$ksu_dir" describe --tags --always 2>/dev/null || echo "$head_sha")
++	if [ -n "$ref" ]; then
++		local want
++		want=$(git -C "$ksu_dir" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null || true)
++		if [ -n "$want" ] && [ "$want" != "$(git -C "$ksu_dir" rev-parse HEAD)" ]; then
++			die "${name} is checked out at ${head_desc}, not the requested ref '${ref}'"
++		fi
++	fi
++	ok "${name} installed at ${head_desc} (${head_sha})"
++
++	# The tree owns the hook call sites; nothing here may patch them again.
++	export_env KSU_HOOK_MODE none
++	export_env KSU_HOOK_MODE_RESOLVED none
++	info "hook mode: none (the in-tree script patches the call sites itself)"
++
++	export_env KSU_DIR "$dir"
++	export_env KSU_NAME "$name"
++	export_env KSU_REF_RESOLVED "${ref:-<tree default>}"
++	export_env KSU_VERSION_LABEL "${ref:-HEAD}-${head_sha}"
++	export_env KSU_SUSFS_BUNDLED_REFS "-"
++	export_env UPLOADNAME "-${name// /_}_${head_sha}"
++
++	summary "| KernelSU variant | \`${name}\` |"
++	summary "| KernelSU ref | \`${ref:-tree default}\` -> \`${head_sha}\` |"
++	summary "| Hooks | patched by the kernel tree |"
++
++	endgroup
++}
++
+ # ------------------------------------------------------------ hook config ---
+ #
+ # Which hook mechanism a variant should use is genuinely version- and
+diff --git a/scripts/patches.sh b/scripts/patches.sh
+index eade6bf..670734c 100644
+--- a/scripts/patches.sh
++++ b/scripts/patches.sh
+@@ -345,6 +345,20 @@ hooks_patch_apply() {
+ kpm_patch_image() {
+ 	local image=$1
+ 	group "Applying KPM (patch_linux)"
++
++	# Trees that carry their own KPM step own the gzip+dtb repacking too.
++	# Duplicating that here would mean two copies of the payload arithmetic
++	# drifting apart, and the tree's copy verifies the result.
++	if [ -x "${KERNEL_DIR}/scripts/kpm-patch.sh" ]; then
++		info "delegating to the kernel tree's scripts/kpm-patch.sh"
++		( cd "$KERNEL_DIR" && OUT_DIR="${KERNEL_DIR}/out" ./scripts/kpm-patch.sh ) \
++			|| die "scripts/kpm-patch.sh failed"
++		ok "KernelPatch injected by the in-tree script"
++		summary "| KPM | applied (in-tree patch script) |"
++		endgroup
++		return 0
++	fi
++
+ 	local dir tool
+ 	dir=$(sukisu_patch_dir)
+ 	tool="${dir}/kpm/patch_linux"

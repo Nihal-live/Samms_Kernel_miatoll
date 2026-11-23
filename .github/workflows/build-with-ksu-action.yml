@@ -1,0 +1,204 @@
+name: Build SKYNET kernel via KernelSU_Action_V2
+
+# Second, independent build path.
+#
+# build-kernel-sukisu.yml is this repo's own pipeline. This one goes through
+# Nihal-live/KernelSU_Action_V2 instead: same kernel, same SukiSU-Nova tree,
+# same KPM step, but the action's scripts do the work, which is what its
+# verbose per-step logging and RUNNER_DEBUG switch are for.
+#
+# The action needs three small additions for this tree (a samms-nova variant,
+# KPM allowed for it, and the KPM step delegating to scripts/kpm-patch.sh).
+# They live in ci/ksu-action-v2/miatoll.patch and are applied here, because
+# this repository has no write access to the action's repository. Nothing else
+# about the action changes -- its scripts still do every step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_ref:
+        description: "KernelSU_Action_V2 commit to build with"
+        required: false
+        default: 26c1b95532549d4cb57ab152f5650003d89c6efb
+      config:
+        description: "Device profile inside the action tree"
+        required: false
+        default: config/miatoll.env
+      debug:
+        description: "Verbose script output (RUNNER_DEBUG)"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ksu-action-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build miatoll via KernelSU_Action_V2
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      WORKSPACE: ${{ github.workspace }}/kernel_workspace
+      CONFIG_ENV: ${{ inputs.config }}
+      ACTION_DIR: ${{ github.workspace }}/ksu-action
+      ACTION_REF: ${{ inputs.action_ref }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch KernelSU_Action_V2 at the pinned commit
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/Nihal-live/KernelSU_Action_V2 \
+            "$ACTION_DIR"
+          git -C "$ACTION_DIR" checkout --quiet "$ACTION_REF"
+          echo "action commit: $(git -C "$ACTION_DIR" rev-parse HEAD)"
+          # The patch is generated against this exact commit; if the action's
+          # scripts moved, refusing here beats applying a fuzzy patch to a
+          # build engine whose internals we then no longer understand.
+          git -C "$ACTION_DIR" apply --check --verbose \
+            "$GITHUB_WORKSPACE/ci/ksu-action-v2/miatoll.patch"
+          git -C "$ACTION_DIR" apply \
+            "$GITHUB_WORKSPACE/ci/ksu-action-v2/miatoll.patch"
+          echo "::group::Patch applied"
+          git -C "$ACTION_DIR" --no-pager diff --stat
+          echo "::endgroup::"
+
+      - name: Verify the patched action before it runs
+        run: |
+          set -euo pipefail
+          cd "$ACTION_DIR"
+          # Fail before a 40-minute build, not after it.
+          grep -q 'samms-nova)' scripts/kernelsu.sh \
+            || { echo "::error::samms-nova variant missing"; exit 1; }
+          grep -q 'samms-nova' scripts/config.sh \
+            || { echo "::error::ENABLE_KPM is still restricted"; exit 1; }
+          grep -q "kpm-patch.sh" scripts/patches.sh \
+            || { echo "::error::KPM delegation missing"; exit 1; }
+          test -f "$CONFIG_ENV" \
+            || { echo "::error::$CONFIG_ENV does not exist"; exit 1; }
+          bash -n scripts/*.sh
+          echo "patched action looks consistent"
+
+      - name: Resolve configuration
+        run: bash scripts/config.sh
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Free up disk space
+        if: env.REMOVE_UNUSED_PACKAGES == 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            git libelf-dev libssl-dev lz4 make python3 rsync unzip zip zstd \
+            libncurses-dev
+          mkdir -p "$WORKSPACE"
+
+      - name: Set up toolchain
+        run: bash scripts/toolchain.sh
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Fetch kernel source
+        run: bash scripts/source.sh
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Install KernelSU
+        if: env.KSU_VARIANT != 'none'
+        run: bash scripts/kernelsu.sh
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Apply kernel patches
+        run: bash scripts/patches.sh all
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Set up ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ksu-action-miatoll-${{ env.KSU_VARIANT }}-${{ env.KERNEL_VERSION }}
+          max-size: 2G
+
+      - name: Build kernel
+        run: bash scripts/build.sh all
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Package artifacts
+        run: bash scripts/package.sh all
+        working-directory: ${{ github.workspace }}/ksu-action
+
+      - name: Export build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          BOOT="$WORKSPACE/android-kernel/out/arch/arm64/boot"
+          {
+            echo "device=${DEVICE:-miatoll}"
+            echo "build_time=$(date -u +%Y%m%d-%H%M)"
+            echo "ksu_name=${KSU_NAME:-SukiSU-Nova}"
+          } >> "$GITHUB_OUTPUT"
+          echo "::group::Boot artefacts"
+          ls -l "$BOOT"
+          echo "::endgroup::"
+          # Same two facts the repo's own workflow asserts: the kernel side of
+          # KPM is compiled in, and the image really carries KernelPatch.
+          grep -q '^CONFIG_KPM=y' "$WORKSPACE/android-kernel/out/.config" \
+            || { echo "::error::CONFIG_KPM did not survive the build"; exit 1; }
+          strings "$BOOT/Image" | grep -q 'KernelPatch Version' \
+            || { echo "::error::Image is not patched for KPM"; exit 1; }
+          echo "KPM: compiled in and injected"
+
+      - name: Upload kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksu-action-${{ steps.meta.outputs.device }}-${{ steps.meta.outputs.build_time }}
+          path: |
+            ${{ github.workspace }}/kernel_workspace/android-kernel/out/arch/arm64/boot/Image
+            ${{ github.workspace }}/kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz
+            ${{ github.workspace }}/kernel_workspace/android-kernel/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload AnyKernel3 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksu-action-AnyKernel3-${{ steps.meta.outputs.device }}-${{ steps.meta.outputs.build_time }}
+          path: ${{ github.workspace }}/kernel_workspace/*.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksu-action-logs-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/kernel_workspace/android-kernel/out/.config
+          if-no-files-found: ignore
+          retention-days: 7
