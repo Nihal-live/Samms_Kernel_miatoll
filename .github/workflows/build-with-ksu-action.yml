@@ -53,6 +53,7 @@ jobs:
       WORKSPACE: ${{ github.workspace }}/kernel_workspace
       CONFIG_ENV: ${{ inputs.config || 'config/miatoll.env' }}
       ACTION_DIR: ${{ github.workspace }}/ksu-action
+      LOG_DIR: ${{ github.workspace }}/ksu-action-logs
       ACTION_REF: ${{ inputs.action_ref || '26c1b95532549d4cb57ab152f5650003d89c6efb' }}
       # Verbose per-step output from the action's own logging helpers. The
       # "debug" input exists only to be explicit; verbose is the default here
@@ -100,7 +101,7 @@ jobs:
           echo "patched action looks consistent"
 
       - name: Resolve configuration
-        run: bash scripts/config.sh
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" config
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Free up disk space
@@ -133,20 +134,20 @@ jobs:
           mkdir -p "$WORKSPACE"
 
       - name: Set up toolchain
-        run: bash scripts/toolchain.sh
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" toolchain
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Fetch kernel source
-        run: bash scripts/source.sh
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" source
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Install KernelSU
         if: env.KSU_VARIANT != 'none'
-        run: bash scripts/kernelsu.sh
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" kernelsu
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Apply kernel patches
-        run: bash scripts/patches.sh all
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" patches all
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Set up ccache
@@ -157,11 +158,11 @@ jobs:
           max-size: 2G
 
       - name: Build kernel
-        run: bash scripts/build.sh all
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" build all
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Package artifacts
-        run: bash scripts/package.sh all
+        run: bash "$GITHUB_WORKSPACE/ci/ksu-action-v2/run-stage.sh" package all
         working-directory: ${{ github.workspace }}/ksu-action
 
       - name: Export build metadata
@@ -210,6 +211,7 @@ jobs:
         with:
           name: ksu-action-logs-${{ github.run_id }}
           path: |
+            ${{ github.workspace }}/ksu-action-logs
             ${{ github.workspace }}/kernel_workspace/android-kernel/out/.config
           if-no-files-found: ignore
           retention-days: 7
