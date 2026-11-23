@@ -142,15 +142,19 @@ Two build flavours exist, and they differ only in what is applied before `make`:
 
 The root flavour is produced by [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh), which
 pins SukiSU-Nova to a commit, wires `drivers/kernelsu`, patches the manual hook call sites a
-4.14 kernel needs, applies two 4.14 fixes to the clone, and injects the `CONFIG_KSU*` symbols into
-the defconfig. Nothing is committed pre-applied: a clean checkout stays a clean kernel tree.
+4.14 kernel needs, ports the >= 5.10 code paths (KPM bridge, CPU identity spoofing, SELinux
+hiding) to this tree, and injects the `CONFIG_KSU*` symbols into the defconfig. Nothing is
+committed pre-applied: a clean checkout stays a clean kernel tree.
 
-What you get: `su`/`ksud` compat, kernel umount, sulog, ADB root, SELinux hide, shell su (adb
-only), mount hide, app profiles and extensions — all toggled from the manager.
+What you get: `su`/`ksud` compat, kernel umount, sulog, ADB root, hide SELinux modification,
+AVC log spoofing, shell su (adb only), mount hide, app profiles and extensions — all toggled
+from the manager — plus **KPM** (`CONFIG_KPM=y`; the built `Image` is post-processed by
+KernelPatch's `kptools` in the same workflow).
 
-What you do not get: **SUSFS** (no maintained 4.14 port of the API SukiSU-Nova calls) and **KPM**
-(its own Kconfig help warns it may affect stability, and it needs 5.10+ interfaces). The reasoning,
-the hook table, the traps this integration defends against and the exact CI assertions are in
+What you do not get: **SUSFS**, the kernel-side root-hiding layer — there is no maintained
+4.14 port of the v2.x API SukiSU-Nova calls. Hide SELinux modification and AVC log spoofing
+are implemented natively instead, without it. The reasoning, the hook table, the traps this
+integration defends against and the exact CI assertions are in
 [`docs/KSU-NOVA.md`](docs/KSU-NOVA.md).
 
 ## The `17` branch

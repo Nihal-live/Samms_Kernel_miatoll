@@ -113,6 +113,20 @@ jobs:
           grep -q '< KERNEL_VERSION(4, 18, 0)' KernelSU/kernel/extension/cpu_spoof.c \
             || { echo "::error::cpu_spoof lost its pre-4.18 vDSO guard"; exit 1; }
           echo "cpu_spoof ported to 4.14"
+
+          # SELinux hiding + AVC log spoofing must be wired, not just
+          # documented: both are re-implemented for 4.14 without SUSFS.
+          grep -q 'ksu_hide_compat.o' security/selinux/Makefile \
+            || { echo "::error::ksu_hide_compat.o is not built"; exit 1; }
+          grep -q 'ksu_avc_log_spoof_matches(tsid)' security/selinux/avc.c \
+            || { echo "::error::avc_dump_query() has no AVC log spoofing"; exit 1; }
+          grep -q 'ksu_selinux_hide_read_policy' security/selinux/ss/services.c \
+            || { echo "::error::security_read_policy() serves the live policy"; exit 1; }
+          grep -q 'ksu_avc_spoof_reboot' kernel/reboot.c \
+            || { echo "::error::reboot() does not answer the SUSFS supercall"; exit 1; }
+          grep -q 'selinux_hide_414.c' KernelSU/kernel/ksu_main.c \
+            || { echo "::error::SukiSU still skips selinux_hide on 4.14"; exit 1; }
+          echo "selinux_hide + avc log spoofing wired for 4.14"
           # KPM: enabled in the defconfig and its three 4.14 ports applied.
           grep -qx 'CONFIG_KPM=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig \
             || { echo "::error::defconfig does not enable CONFIG_KPM"; exit 1; }

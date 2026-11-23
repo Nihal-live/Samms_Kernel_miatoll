@@ -19,8 +19,11 @@
 #   No SUSFS. Root hiding (SUSFS) is deliberately *not* part of this kernel:
 #   it needs a kernel-side port that no upstream branch ships for 4.14 with the
 #   API SukiSU-Nova calls, and a half-ported root-hiding layer is exactly the
-#   kind of thing that turns a working root into an unstable device. The only
-#   files this script touches outside drivers/ are the four hook call sites.
+#   kind of thing that turns a working root into an unstable device. What this
+#   script touches outside drivers/ is: the manual hook call sites (section
+#   4), the KPM syscall-wrapper stub (section 3.5) and the SELinux support
+#   file behind "hide SELinux modification" and AVC log spoofing (section
+#   3.6), which replaces SUSFS's share of those two features.
 #
 # WHY A PINNED COMMIT
 #   `builtin` moves. Every KernelSU setup.sh ends its checkout with
@@ -694,6 +697,917 @@ grep -q '< KERNEL_VERSION(4, 18, 0)' "$KSU_DIR/kernel/extension/cpu_spoof.c" \
 grep -q '>= KERNEL_VERSION(4, 20, 0)' "$KSU_DIR/kernel/extension/cpu_spoof.c" \
     || die "cpu_spoof.c lost its elf_hwcap2 guard"
 
+# -- 3.6 SELinux hiding and AVC log spoofing on 4.14 --------------------------
+#
+# Two manager toggles read "Kernel does not support this feature" on this
+# kernel, for two unrelated reasons:
+#
+#   * "Hide SELinux modification" exists in SukiSU-Nova only for >= 5.10:
+#     kernel/ksu_main.c does not even include feature/selinux_hide.c on 4.14,
+#     so the KSU_FEATURE_SELINUX_HIDE handler is never registered and the
+#     manager is told the feature does not exist. Upstream's file is written
+#     against struct selinux_policy (5.6+) and duplicates the whole policydb,
+#     which has no 4.14 counterpart.
+#   * "AVC log spoofing" lives only inside the CONFIG_KSU_SUSFS block of
+#     kernel/supercall/dispatch.c and is driven over
+#     reboot(SUSFS_MAGIC, cmd, ...). SUSFS is off, so nothing answers it.
+#
+# Both are re-implemented here for 4.14, without SUSFS:
+#
+#   * AVC spoofing is the same rewrite susfs4ksu performs in avc_dump_query():
+#     a denial whose *target* is KernelSU's own domain ("u:r:ksu:s0" for this
+#     ref) is logged with a priv_app context instead. The four SUSFS reboot()
+#     commands the manager needs -- SHOW_VERSION, SHOW_VARIANT,
+#     SHOW_ENABLED_FEATURES and ENABLE_AVC_LOG_SPOOFING -- are answered by the
+#     new security/selinux/ksu_hide_compat.c.
+#
+#   * "Hide SELinux modification" snapshots the *pristine* policy. The init
+#     second stage runs before apply_kernelsu_rules() -- the same ordering
+#     upstream depends on -- so the bytes read there are the stock policy.
+#     With the feature on, /sys/fs/selinux/policy, its inode size and the
+#     policyload counter report that pristine policy instead of the live one.
+#     This is a deliberate subset of upstream: it hides what a detector reads
+#     back (policy dump, policy load counter), not the sidtab-level queries
+#     upstream also redirects.
+#
+# Everything below the kernel side is gated on CONFIG_KSU, so a build without
+# KernelSU compiles the untouched SELinux code.
+
+if [[ "$MODE" != check ]]; then
+
+mkdir -p security/selinux
+cat > include/linux/ksu_hide_compat.h <<'KSU_HIDE_H'
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * 4.14 glue for two SukiSU-Nova features that upstream only ships for newer
+ * kernels ("hide SELinux modification") or only behind CONFIG_KSU_SUSFS
+ * ("AVC log spoofing").
+ *
+ * Implemented in security/selinux/ksu_hide_compat.c, which is built only when
+ * CONFIG_KSU is enabled; every call site is wrapped in #ifdef CONFIG_KSU.
+ */
+#ifndef _LINUX_KSU_HIDE_COMPAT_H
+#define _LINUX_KSU_HIDE_COMPAT_H
+
+#include <linux/compiler.h>
+#include <linux/types.h>
+
+struct selinux_state;
+
+/* ---- AVC log spoofing --------------------------------------------------- */
+bool ksu_avc_log_spoof_matches(u32 tsid);
+const char *ksu_avc_spoof_tcontext(void);
+
+/*
+ * Handles the SUSFS-compatible reboot() supercall the manager uses for AVC log
+ * spoofing. Returns true when it consumed the call, i.e. the syscall must
+ * return 0 instead of falling through to the real reboot path.
+ */
+bool ksu_avc_spoof_reboot(int magic1, int magic2, unsigned int cmd,
+			  void __user *argp);
+
+/* ---- hiding KernelSU's SELinux modifications ---------------------------- */
+int ksu_selinux_hide_capture(void);
+bool ksu_selinux_hide_ready(void);
+bool ksu_selinux_hide_active(void);
+size_t ksu_selinux_hide_snapshot_len(void);
+void ksu_selinux_hide_set_enabled(bool on);
+u32 ksu_selinux_hide_mask_policyload(u32 seqno);
+
+/*
+ * Override for security_read_policy(): returns 0 with a fresh vmalloc_user()
+ * buffer when the pristine snapshot should be served, -EAGAIN otherwise.
+ */
+int ksu_selinux_hide_read_policy(void **data, size_t *len);
+
+/* Implemented in ss/status.c, the only place struct selinux_ss is visible. */
+void ksu_selinux_hide_rewrite_status(struct selinux_state *state,
+				     u32 policyload);
+
+#endif /* _LINUX_KSU_HIDE_COMPAT_H */
+KSU_HIDE_H
+
+cat > security/selinux/ksu_hide_compat.c <<'KSU_HIDE_C'
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * 4.14 support for two SukiSU-Nova features whose upstream implementations do
+ * not exist on this kernel:
+ *
+ *   "Hide SELinux modification" -- upstream (kernel/feature/selinux_hide.c) is
+ *       written against struct selinux_policy, which appeared in 5.6, and
+ *       duplicates the policydb. Here the pristine policy is snapshotted at the
+ *       init second stage -- the moment where the stock policy is loaded but
+ *       apply_kernelsu_rules() has not run yet -- and served back in place of
+ *       the live one, together with the pristine policyload counter.
+ *
+ *   "AVC log spoofing" -- upstream only exists behind CONFIG_KSU_SUSFS. The
+ *       rewrite below is the one susfs4ksu performs in avc_dump_query(), and
+ *       the SUSFS reboot() supercall the manager drives it with is answered
+ *       here so that no SUSFS code is needed.
+ */
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/vmalloc.h>
+#include <linux/mutex.h>
+#include <linux/cred.h>
+#include <linux/audit.h>
+#include <linux/sched.h>
+#include <linux/security.h>
+#include <linux/ksu_hide_compat.h>
+
+#include "security.h"
+
+/* The SUSFS userspace ABI, as susfs4ksu implements it. */
+#define KSU_SUSFS_MAGIC			0xFAFAFAFA
+#define KSU_SUSFS_SHOW_VERSION		0x555e1
+#define KSU_SUSFS_SHOW_ENABLED_FEATURES	0x555e2
+#define KSU_SUSFS_SHOW_VARIANT		0x555e3
+#define KSU_SUSFS_ENABLE_AVC_LOG_SPOOFING 0x60010
+
+/* KSU_INSTALL_MAGIC1 from SukiSU's uapi/supercall.h; the manager sends it as
+ * the first reboot() argument, exactly like the SUSFS tool does. */
+#define KSU_SUPERCALL_MAGIC1		0xDEADBEEF
+
+#define KSU_SUSFS_ENABLED_FEATURES_SIZE	8192
+#define KSU_SUSFS_MAX_VERSION_BUFSIZE	16
+#define KSU_SUSFS_MAX_VARIANT_BUFSIZE	16
+
+/* Reported to the manager so that it offers the SUSFS-driven AVC toggle. This
+ * bridge implements AVC log spoofing only; the version is the susfs4ksu one
+ * the code below was modelled on. */
+#define KSU_SUSFS_VERSION		"v2.4.0"
+#define KSU_SUSFS_VARIANT		"NON-GKI"
+#define KSU_SUSFS_FEATURES		"CONFIG_KSU_SUSFS_AVC_LOG_SPOOFING\n"
+
+/* Android's priv_app context, and the domain KernelSU switches to
+ * (KERNEL_SU_CONTEXT in SukiSU's kernel/selinux/selinux.h). */
+#define KSU_AVC_SPOOF_TCONTEXT		"u:r:priv_app:s0:c512,c768"
+#define KSU_AVC_SPOOF_TARGET_CONTEXT	"u:r:ksu:s0"
+
+struct ksu_susfs_avc_log_spoofing {
+	bool enabled;
+	int err;
+};
+
+struct ksu_susfs_enabled_features {
+	char enabled_features[KSU_SUSFS_ENABLED_FEATURES_SIZE];
+	int err;
+};
+
+struct ksu_susfs_variant {
+	char susfs_variant[KSU_SUSFS_MAX_VARIANT_BUFSIZE];
+	int err;
+};
+
+struct ksu_susfs_version {
+	char susfs_version[KSU_SUSFS_MAX_VERSION_BUFSIZE];
+	int err;
+};
+
+static DEFINE_MUTEX(ksu_hide_lock);
+
+/* ---- AVC log spoofing --------------------------------------------------- */
+
+static bool ksu_avc_spoof_on;
+static bool ksu_avc_spoof_sid_valid;
+static u32 ksu_avc_spoof_sid;
+
+bool ksu_avc_log_spoof_matches(u32 tsid)
+{
+	return READ_ONCE(ksu_avc_spoof_on) && READ_ONCE(ksu_avc_spoof_sid_valid) &&
+	       tsid == READ_ONCE(ksu_avc_spoof_sid);
+}
+
+const char *ksu_avc_spoof_tcontext(void)
+{
+	return KSU_AVC_SPOOF_TCONTEXT;
+}
+
+static int ksu_avc_spoof_resolve_sid(void)
+{
+	u32 sid = 0;
+	int err;
+
+	err = security_secctx_to_secid(KSU_AVC_SPOOF_TARGET_CONTEXT,
+				       strlen(KSU_AVC_SPOOF_TARGET_CONTEXT), &sid);
+	if (err || !sid) {
+		pr_warn("ksu: avc spoof: cannot resolve %s (%d)\n",
+			KSU_AVC_SPOOF_TARGET_CONTEXT, err);
+		return -EINVAL;
+	}
+
+	WRITE_ONCE(ksu_avc_spoof_sid, sid);
+	WRITE_ONCE(ksu_avc_spoof_sid_valid, true);
+	pr_info("ksu: avc spoof: masking denials targeting sid %u\n", sid);
+	return 0;
+}
+
+static void ksu_susfs_show_version(void __user *argp)
+{
+	struct ksu_susfs_version info;
+
+	memset(&info, 0, sizeof(info));
+	if (copy_from_user(&info, argp, sizeof(info))) {
+		info.err = -EFAULT;
+	} else {
+		memcpy(info.susfs_version, KSU_SUSFS_VERSION,
+		       sizeof(KSU_SUSFS_VERSION));
+		info.err = 0;
+	}
+	if (copy_to_user(argp, &info, sizeof(info)))
+		pr_warn("ksu: SUSFS SHOW_VERSION: copy_to_user failed\n");
+}
+
+static void ksu_susfs_show_variant(void __user *argp)
+{
+	struct ksu_susfs_variant info;
+
+	memset(&info, 0, sizeof(info));
+	if (copy_from_user(&info, argp, sizeof(info))) {
+		info.err = -EFAULT;
+	} else {
+		memcpy(info.susfs_variant, KSU_SUSFS_VARIANT,
+		       sizeof(KSU_SUSFS_VARIANT));
+		info.err = 0;
+	}
+	if (copy_to_user(argp, &info, sizeof(info)))
+		pr_warn("ksu: SUSFS SHOW_VARIANT: copy_to_user failed\n");
+}
+
+static void ksu_susfs_show_enabled_features(void __user *argp)
+{
+	struct ksu_susfs_enabled_features *info;
+	int err = 0;
+
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	if (copy_from_user(info, argp, sizeof(*info))) {
+		info->err = -EFAULT;
+	} else {
+		memcpy(info->enabled_features, KSU_SUSFS_FEATURES,
+		       sizeof(KSU_SUSFS_FEATURES));
+		info->err = 0;
+	}
+	if (copy_to_user(argp, info, sizeof(*info)))
+		err = -EFAULT;
+	kfree(info);
+out:
+	if (err)
+		pr_warn("ksu: SUSFS SHOW_ENABLED_FEATURES failed: %d\n", err);
+}
+
+static void ksu_susfs_set_avc_log_spoofing(void __user *argp)
+{
+	struct ksu_susfs_avc_log_spoofing info;
+
+	memset(&info, 0, sizeof(info));
+	if (copy_from_user(&info, argp, sizeof(info))) {
+		info.err = -EFAULT;
+	} else if (info.enabled && !READ_ONCE(ksu_avc_spoof_sid_valid) &&
+		   ksu_avc_spoof_resolve_sid()) {
+		/* Without the domain's SID there is nothing to mask. */
+		info.err = -EINVAL;
+	} else {
+		WRITE_ONCE(ksu_avc_spoof_on, info.enabled);
+		info.err = 0;
+		pr_info("ksu: avc spoof: %s\n",
+			info.enabled ? "enabled" : "disabled");
+	}
+	if (copy_to_user(argp, &info, sizeof(info)))
+		pr_warn("ksu: SUSFS ENABLE_AVC_LOG_SPOOFING: copy_to_user failed\n");
+}
+
+bool ksu_avc_spoof_reboot(int magic1, int magic2, unsigned int cmd,
+			  void __user *argp)
+{
+	/* Both magics are 32-bit values above INT_MAX in unsigned form. */
+	if ((unsigned int)magic1 != KSU_SUPERCALL_MAGIC1 ||
+	    (unsigned int)magic2 != KSU_SUSFS_MAGIC)
+		return false;
+
+	if (current_uid().val != 0) {
+		pr_warn("ksu: SUSFS supercall from uid %u, ignoring\n",
+			current_uid().val);
+		return true;
+	}
+
+	switch (cmd) {
+	case KSU_SUSFS_SHOW_VERSION:
+		ksu_susfs_show_version(argp);
+		break;
+	case KSU_SUSFS_SHOW_VARIANT:
+		ksu_susfs_show_variant(argp);
+		break;
+	case KSU_SUSFS_SHOW_ENABLED_FEATURES:
+		ksu_susfs_show_enabled_features(argp);
+		break;
+	case KSU_SUSFS_ENABLE_AVC_LOG_SPOOFING:
+		ksu_susfs_set_avc_log_spoofing(argp);
+		break;
+	default:
+		pr_info("ksu: unsupported SUSFS command 0x%x\n", cmd);
+		return false;
+	}
+
+	return true;
+}
+
+/* ---- hiding KernelSU's SELinux modifications ---------------------------- */
+
+static void *ksu_policy_snapshot;
+static size_t ksu_policy_snapshot_len;
+static bool ksu_policy_snapshot_policyload_valid;
+static u32 ksu_policy_snapshot_policyload;
+static bool ksu_hide_capturing;
+static bool ksu_hide_on;
+
+bool ksu_selinux_hide_ready(void)
+{
+	return READ_ONCE(ksu_policy_snapshot) != NULL;
+}
+
+bool ksu_selinux_hide_active(void)
+{
+	return READ_ONCE(ksu_hide_on) && ksu_selinux_hide_ready();
+}
+
+size_t ksu_selinux_hide_snapshot_len(void)
+{
+	return READ_ONCE(ksu_policy_snapshot_len);
+}
+
+/*
+ * Snapshot the policy that is live right now. Called from the init second
+ * stage, before apply_kernelsu_rules(), and again when the manager enables the
+ * feature in case the first call came too early (policy not loaded yet).
+ */
+int ksu_selinux_hide_capture(void)
+{
+	struct selinux_state *state = &selinux_state;
+	struct page *page;
+	void *data = NULL;
+	size_t len = 0;
+	int ret;
+
+	mutex_lock(&ksu_hide_lock);
+	if (READ_ONCE(ksu_policy_snapshot)) {
+		ret = 0;
+		goto out;
+	}
+	if (!selinux_initialized(state)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	ksu_hide_capturing = true;
+	ret = security_read_policy(state, &data, &len);
+	ksu_hide_capturing = false;
+	if (ret || !data || !len) {
+		if (!ret)
+			ret = -EINVAL;
+		vfree(data);
+		goto out;
+	}
+
+	/*
+	 * The status page only exists once something mmaps it, and a freshly
+	 * allocated one reads policyload == 0. Android loads the policy exactly
+	 * once (init), and this runs before apply_kernelsu_rules(), so 1 is the
+	 * pristine count when the page has no counter yet.
+	 */
+	page = selinux_kernel_status_page(state);
+	if (page) {
+		struct selinux_kernel_status *status = page_address(page);
+
+		ksu_policy_snapshot_policyload = status->policyload ?
+						  status->policyload : 1;
+		ksu_policy_snapshot_policyload_valid = true;
+	}
+
+	ksu_policy_snapshot_len = len;
+	smp_wmb();
+	WRITE_ONCE(ksu_policy_snapshot, data);
+
+	pr_info("ksu: selinux_hide: pristine policy captured, %zu bytes, policyload %u\n",
+		len, ksu_policy_snapshot_policyload);
+	ret = 0;
+out:
+	mutex_unlock(&ksu_hide_lock);
+	return ret;
+}
+
+int ksu_selinux_hide_read_policy(void **data, size_t *len)
+{
+	void *copy;
+
+	if (!ksu_selinux_hide_active() || READ_ONCE(ksu_hide_capturing))
+		return -EAGAIN;
+
+	copy = vmalloc_user(ksu_selinux_hide_snapshot_len());
+	if (!copy)
+		return -ENOMEM;
+	memcpy(copy, READ_ONCE(ksu_policy_snapshot), ksu_selinux_hide_snapshot_len());
+
+	*data = copy;
+	*len = ksu_selinux_hide_snapshot_len();
+	return 0;
+}
+
+void ksu_selinux_hide_set_enabled(bool on)
+{
+	mutex_lock(&ksu_hide_lock);
+	WRITE_ONCE(ksu_hide_on, on);
+	if (on && READ_ONCE(ksu_policy_snapshot_policyload_valid))
+		ksu_selinux_hide_rewrite_status(&selinux_state,
+						ksu_policy_snapshot_policyload);
+	mutex_unlock(&ksu_hide_lock);
+
+	pr_info("ksu: selinux_hide: %s\n", on ? "enabled" : "disabled");
+}
+
+u32 ksu_selinux_hide_mask_policyload(u32 seqno)
+{
+	if (ksu_selinux_hide_active() &&
+	    READ_ONCE(ksu_policy_snapshot_policyload_valid))
+		return READ_ONCE(ksu_policy_snapshot_policyload);
+	return seqno;
+}
+KSU_HIDE_C
+
+python3 - "security/selinux/Makefile" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+anchor = "selinux-$(CONFIG_SECURITY_NETWORK_XFRM) += xfrm.o\n"
+want = ("\n"
+        "# KernelSU's 4.14 stand-ins for the >= 5.10 SELinux hiding and for\n"
+        "# the SUSFS-only AVC log spoofing.\n"
+        "selinux-$(CONFIG_KSU) += ksu_hide_compat.o\n")
+
+if "ksu_hide_compat.o" in src:
+    print("[ksu-nova]   selinux Makefile: already applied")
+elif anchor not in src:
+    sys.exit("[ksu-nova] ERROR: selinux Makefile anchor missing")
+else:
+    open(path, "w").write(src.replace(anchor, anchor + want, 1))
+    print("[ksu-nova]   selinux Makefile: added ksu_hide_compat.o")
+PY
+
+python3 - "security/selinux/avc.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+src = once(
+    src,
+    '#include "avc.h"\n',
+    "#include <linux/ksu_hide_compat.h>\n"
+    '#include "avc.h"\n',
+    "avc.c: include ksu_hide_compat.h")
+
+src = once(
+    src,
+    "\trc = security_sid_to_context(state, tsid, &scontext, &scontext_len);\n"
+    "\tif (rc)\n"
+    "\t\taudit_log_format(ab, \" tsid=%d\", tsid);\n"
+    "\telse {\n"
+    "\t\taudit_log_format(ab, \" tcontext=%s\", scontext);\n"
+    "\t\tkfree(scontext);\n"
+    "\t}\n"
+    "\n"
+    "\tBUG_ON(!tclass || tclass >= ARRAY_SIZE(secclass_map));\n",
+
+    "\trc = security_sid_to_context(state, tsid, &scontext, &scontext_len);\n"
+    "#ifdef CONFIG_KSU\n"
+    "\t/*\n"
+    "\t * AVC log spoofing: when the *target* of a denial is KernelSU's own\n"
+    "\t * domain, log a priv_app context instead so that the line does not\n"
+    "\t * point at root. This is the rewrite susfs4ksu performs in its\n"
+    "\t * avc_dump_query() hook, which only exists with CONFIG_KSU_SUSFS.\n"
+    "\t */\n"
+    "\tif (ksu_avc_log_spoof_matches(tsid)) {\n"
+    "\t\tif (!rc)\n"
+    "\t\t\tkfree(scontext);\n"
+    "\t\taudit_log_format(ab, \" tcontext=%s\", ksu_avc_spoof_tcontext());\n"
+    "\t\tgoto out_tclass;\n"
+    "\t}\n"
+    "#endif\n"
+    "\tif (rc)\n"
+    "\t\taudit_log_format(ab, \" tsid=%d\", tsid);\n"
+    "\telse {\n"
+    "\t\taudit_log_format(ab, \" tcontext=%s\", scontext);\n"
+    "\t\tkfree(scontext);\n"
+    "\t}\n"
+    "\n"
+    "#ifdef CONFIG_KSU\n"
+    "out_tclass:\n"
+    "#endif\n"
+    "\tBUG_ON(!tclass || tclass >= ARRAY_SIZE(secclass_map));\n",
+    "avc.c: avc_dump_query() AVC log spoofing")
+
+open(path, "w").write(src)
+PY
+
+python3 - "security/selinux/ss/services.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+src = once(
+    src,
+    "#include <net/netlabel.h>\n",
+    "#include <net/netlabel.h>\n"
+    "#include <linux/ksu_hide_compat.h>\n",
+    "services.c: include ksu_hide_compat.h")
+
+src = once(
+    src,
+    "int security_read_policy(struct selinux_state *state,\n"
+    "\t\t\t void **data, size_t *len)\n"
+    "{\n"
+    "\tstruct policydb *policydb = &state->ss->policydb;\n"
+    "\tint rc;\n"
+    "\tstruct policy_file fp;\n"
+    "\n",
+
+    "int security_read_policy(struct selinux_state *state,\n"
+    "\t\t\t void **data, size_t *len)\n"
+    "{\n"
+    "\tstruct policydb *policydb = &state->ss->policydb;\n"
+    "\tint rc;\n"
+    "\tstruct policy_file fp;\n"
+    "\n"
+    "#ifdef CONFIG_KSU\n"
+    "\t/* \"Hide SELinux modification\": serve the pristine policy dump. */\n"
+    "\tif (!ksu_selinux_hide_read_policy(data, len))\n"
+    "\t\treturn 0;\n"
+    "#endif\n"
+    "\n",
+    "services.c: security_read_policy() pristine dump")
+
+src = once(
+    src,
+    "size_t security_policydb_len(struct selinux_state *state)\n"
+    "{\n"
+    "\tstruct policydb *p = &state->ss->policydb;\n"
+    "\tsize_t len;\n"
+    "\n",
+
+    "size_t security_policydb_len(struct selinux_state *state)\n"
+    "{\n"
+    "\tstruct policydb *p = &state->ss->policydb;\n"
+    "\tsize_t len;\n"
+    "\n"
+    "#ifdef CONFIG_KSU\n"
+    "\t/* Keep the selinuxfs inode size in step with the snapshot. */\n"
+    "\tif (ksu_selinux_hide_active())\n"
+    "\t\treturn ksu_selinux_hide_snapshot_len();\n"
+    "#endif\n"
+    "\n",
+    "services.c: security_policydb_len() snapshot size")
+
+src = once(
+    src,
+    "\t\tavc_ss_reset(state->avc, seqno);\n"
+    "\t\tselnl_notify_policyload(seqno);\n"
+    "\t\tselinux_status_update_policyload(state, seqno);\n",
+
+    "\t\tavc_ss_reset(state->avc, seqno);\n"
+    "#ifdef CONFIG_KSU\n"
+    "\t\t/* Report the pristine load count, not KernelSU's reload. */\n"
+    "\t\tseqno = ksu_selinux_hide_mask_policyload(seqno);\n"
+    "#endif\n"
+    "\t\tselnl_notify_policyload(seqno);\n"
+    "\t\tselinux_status_update_policyload(state, seqno);\n",
+    "services.c: policyload masking")
+
+open(path, "w").write(src)
+PY
+
+if grep -q 'ksu_selinux_hide_rewrite_status' security/selinux/ss/status.c; then
+    log "  status.c: ksu_selinux_hide_rewrite_status() already present"
+else
+cat >> security/selinux/ss/status.c <<'KSU_STATUS_C'
+
+#ifdef CONFIG_KSU
+/*
+ * "Hide SELinux modification": rewrite the load counter the status page
+ * reports, so that KernelSU's policy load does not show up on
+ * /sys/fs/selinux/status. struct selinux_ss is only visible here.
+ */
+void ksu_selinux_hide_rewrite_status(struct selinux_state *state, u32 policyload)
+{
+	struct selinux_kernel_status *status;
+
+	mutex_lock(&state->ss->status_lock);
+	if (state->ss->status_page) {
+		status = page_address(state->ss->status_page);
+
+		status->sequence++;
+		smp_wmb();
+		status->policyload = policyload;
+		smp_wmb();
+		status->sequence++;
+	}
+	mutex_unlock(&state->ss->status_lock);
+}
+#endif
+KSU_STATUS_C
+fi
+
+python3 - "kernel/reboot.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+# The include is independent of section 4 below, which adds the KSU extern.
+src = once(
+    src,
+    "#include <linux/uaccess.h>\n",
+    "#include <linux/uaccess.h>\n"
+    "#include <linux/kernel.h>\n"
+    "#include <linux/ksu_hide_compat.h>\n",
+    "reboot.c: include ksu_hide_compat.h")
+
+# ...and the SUSFS supercall is consumed at the top of the syscall, before the
+# CAP_SYS_BOOT check and before section 4's ksu_handle_sys_reboot() call.
+src = once(
+    src,
+    "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n"
+    "\t\tvoid __user *, arg)\n"
+    "{\n"
+    "\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n"
+    "\tchar buffer[256];\n"
+    "\tint ret = 0;\n",
+
+    "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n"
+    "\t\tvoid __user *, arg)\n"
+    "{\n"
+    "\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n"
+    "\tchar buffer[256];\n"
+    "\tint ret = 0;\n"
+    "#ifdef CONFIG_KSU\n"
+    "\t/*\n"
+    "\t * The manager drives AVC log spoofing over the SUSFS reboot()\n"
+    "\t * supercall. When this returns true the call was ours, so do not\n"
+    "\t * fall through to the real reboot path (whose magic check would\n"
+    "\t * fail with -EINVAL and make the manager report a failure).\n"
+    "\t */\n"
+    "\tif (system_state == SYSTEM_RUNNING &&\n"
+    "\t    ksu_avc_spoof_reboot(magic1, magic2, cmd, arg))\n"
+    "\t\treturn 0;\n"
+    "#endif\n",
+    "reboot.c: SUSFS supercall for AVC log spoofing")
+
+open(path, "w").write(src)
+PY
+
+# ---- the SukiSU-Nova side: the 4.14 feature implementation --------------------
+
+cat > "$KSU_DIR/kernel/feature/selinux_hide_414.c" <<'KSU_SELINUX_414'
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * "Hide SELinux modification" for kernels older than 5.10.
+ *
+ * Upstream's kernel/feature/selinux_hide.c is built around struct
+ * selinux_policy (5.6+) and duplicates the whole policydb, which has no 4.14
+ * counterpart. Here the pristine policy is snapshotted at the init second
+ * stage -- before apply_kernelsu_rules() adds KernelSU's rules -- and the
+ * policy dump and load counter are served from that snapshot while the feature
+ * is enabled. The heavy lifting lives in the kernel, in
+ * security/selinux/ksu_hide_compat.c; this file only owns the KSU feature id.
+ */
+#include "selinux_hide.h"
+#include <linux/ksu_hide_compat.h>
+
+static bool ksu_selinux_hide_enabled;
+static bool ksu_selinux_hide_running;
+static DEFINE_MUTEX(selinux_hide_mutex);
+
+static int selinux_hide_feature_get(u64 *value)
+{
+    *value = ksu_selinux_hide_enabled ? 1 : 0;
+    return 0;
+}
+
+static int selinux_hide_feature_set(u64 value)
+{
+    bool enable = value != 0;
+    int ret = 0;
+
+    pr_info("selinux_hide: set to %d\n", enable);
+
+    mutex_lock(&selinux_hide_mutex);
+    ksu_selinux_hide_enabled = enable;
+
+    if (enable) {
+        /*
+         * The snapshot is taken at the init second stage, before
+         * apply_kernelsu_rules() touches the policy. Capturing here instead
+         * would snapshot an already-modified policy, so a missing snapshot
+         * is reported the way upstream reports it: save the setting and
+         * reboot.
+         */
+        if (!ksu_selinux_hide_ready()) {
+            pr_err("selinux_hide: no pristine sepolicy snapshot, "
+                   "save the feature and reboot to retry\n");
+            ksu_selinux_hide_enabled = false;
+            ret = -EAGAIN;
+        } else {
+            ksu_selinux_hide_set_enabled(true);
+            ksu_selinux_hide_running = true;
+        }
+    } else {
+        ksu_selinux_hide_set_enabled(false);
+        ksu_selinux_hide_running = false;
+    }
+
+    pr_info("selinux_hide: enabled %d, running %d\n",
+            ksu_selinux_hide_enabled, ksu_selinux_hide_running);
+    mutex_unlock(&selinux_hide_mutex);
+    return ret;
+}
+
+static const struct ksu_feature_handler selinux_hide_handler = {
+    .feature_id = KSU_FEATURE_SELINUX_HIDE,
+    .name = "selinux_hide",
+    .get_handler = selinux_hide_feature_get,
+    .set_handler = selinux_hide_feature_set,
+};
+
+void ksu_selinux_hide_handle_second_stage(void)
+{
+    if (ksu_selinux_hide_capture())
+        pr_warn("selinux_hide: could not capture the pristine policy yet\n");
+    else
+        pr_info("selinux_hide: pristine policy captured\n");
+}
+
+void ksu_selinux_hide_handle_post_fs_data(void)
+{
+    /*
+     * Nothing to do. The snapshot has to come from the second stage: by the
+     * time post-fs-data runs, apply_kernelsu_rules() has already rewritten the
+     * policy, so capturing here would snapshot the modified one.
+     */
+    pr_info("selinux_hide: %s\n",
+            ksu_selinux_hide_enabled ? "active" : "inactive");
+}
+
+void ksu_selinux_hide_drop_backup_if_unused(void)
+{
+    /*
+     * The snapshot is a few hundred kilobytes and is kept for the lifetime of
+     * the kernel: freeing it could race a concurrent /sys/fs/selinux/policy
+     * read, and the feature can be toggled on at any later point.
+     */
+    if (!ksu_selinux_hide_enabled)
+        pr_info("selinux_hide: feature off, snapshot kept\n");
+}
+
+void __init ksu_selinux_hide_init(void)
+{
+    if (ksu_register_feature_handler(&selinux_hide_handler))
+        pr_err("Failed to register selinux_hide feature handler\n");
+    else
+        pr_info("selinux_hide: feature handler registered (4.14 backport)\n");
+}
+
+void __exit ksu_selinux_hide_exit(void)
+{
+    ksu_selinux_hide_set_enabled(false);
+    ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+}
+KSU_SELINUX_414
+
+python3 - "$KSU_DIR/kernel" <<'PY'
+import re
+import sys
+
+KSU = sys.argv[1]
+
+def edit(path, old, new, label):
+    src = open(path).read()
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    open(path, "w").write(src.replace(old, new, 1))
+    print("[ksu-nova]   " + label)
+
+main = KSU + "/ksu_main.c"
+
+# 1. Include the 4.14 implementation instead of skipping the feature entirely.
+edit(
+    main,
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+    '#include "feature/selinux_hide.c"\n'
+    "#endif\n",
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+    '#include "feature/selinux_hide.c"\n'
+    "#else\n"
+    "/* 4.14: pristine-policy snapshot + policyload masking. */\n"
+    '#include "feature/selinux_hide_414.c"\n'
+    "#endif\n",
+    "ksu_main.c: 4.14 selinux_hide implementation")
+
+# 2. Register the feature handler on 4.14 as well.
+edit(
+    main,
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+    "    ksu_selinux_hide_init();\n"
+    "#endif\n",
+    "    ksu_selinux_hide_init();\n",
+    "ksu_main.c: ksu_selinux_hide_init() unguarded")
+
+# 3. The second-stage / post-fs-data / boot-completed calls are the ones that
+#    decide *when* the snapshot is taken, so they must run on 4.14 too.
+ksud = KSU + "/runtime/ksud.c"
+src = open(ksud).read()
+calls = [
+    "ksu_selinux_hide_handle_second_stage()",
+    "ksu_selinux_hide_handle_post_fs_data()",
+    "ksu_selinux_hide_drop_backup_if_unused()",
+]
+for call in calls:
+    pattern = re.compile(
+        r"#if LINUX_VERSION_CODE >= KERNEL_VERSION\(5, 10, 0\)\n"
+        r"([ \t]*" + re.escape(call) + r";\n)"
+        r"#endif\n")
+    if re.search(r"^[ \t]*" + re.escape(call) + r";$", src, re.M):
+        print("[ksu-nova]   ksud.c: " + call + " already unguarded")
+        continue
+    src, n = pattern.subn(r"\1", src)
+    if not n:
+        sys.exit("[ksu-nova] ERROR: " + call + " guard missing in " + ksud
+                 + " (upstream changed)")
+    print("[ksu-nova]   ksud.c: " + call + " unguarded (%d site(s))" % n)
+open(ksud, "w").write(src)
+PY
+
+fi  # MODE != check
+
+# ---- verification, both in --check mode and after applying --------------------
+
+[[ -f include/linux/ksu_hide_compat.h ]] || die "ksu_hide_compat.h missing"
+[[ -f security/selinux/ksu_hide_compat.c ]] || die "ksu_hide_compat.c missing"
+grep -q 'ksu_hide_compat.o' security/selinux/Makefile || die "selinux Makefile not patched"
+grep -q 'ksu_avc_log_spoof_matches(tsid)' security/selinux/avc.c || die "avc.c not patched"
+grep -q 'ksu_selinux_hide_read_policy' security/selinux/ss/services.c || die "services.c not patched"
+grep -q 'ksu_selinux_hide_rewrite_status' security/selinux/ss/status.c || die "status.c not patched"
+grep -q 'ksu_avc_spoof_reboot' kernel/reboot.c || die "reboot.c not patched"
+grep -q 'selinux_hide_414.c' "$KSU_DIR/kernel/ksu_main.c" \
+    || die "SukiSU still skips selinux_hide.c on 4.14 (5.10-only)"
+[[ -f "$KSU_DIR/kernel/feature/selinux_hide_414.c" ]] || die "selinux_hide_414.c missing"
+grep -q 'ksu_selinux_hide_handle_second_stage();' "$KSU_DIR/kernel/runtime/ksud.c" \
+    || die "second-stage snapshot hook missing"
+ok "SELinux hiding + AVC log spoofing wired for 4.14"
+
 # ------------------------------------------------------------- 4. KSU hooks ---
 #
 # SukiSU-Nova's `builtin` ref is source-integrated: the kernel has to call its
@@ -1094,10 +2008,12 @@ cat <<EOF
 [ksu-nova]                 shell su adb only, mount hide, cpu identity spoof,
 [ksu-nova]                 KPM (CONFIG_KPM=y + the __arm64_sys_* shim;
 [ksu-nova]                 the built Image must still be post-processed by
-[ksu-nova]                 KernelPatch's kptools)
-[ksu-nova]                 (manager-toggled; compiled in unconditionally)
-[ksu-nova]   not included: SUSFS, selinux hide (needs 5.6+ SELinux internals),
-[ksu-nova]                 AVC log spoofing (SUSFS-only)
+[ksu-nova]                 KernelPatch's kptools),
+[ksu-nova]                 hide SELinux modification (pristine-policy
+[ksu-nova]                 snapshot; 4.14 edition of SukiSU's >= 5.10 file),
+[ksu-nova]                 AVC log spoofing (native, driven over the SUSFS
+[ksu-nova]                 reboot() supercall; no SUSFS code involved)
+[ksu-nova]   not included: SUSFS itself (the whole root-hiding layer)
 [ksu-nova]   next        : scripts/build.sh --clang-dir <clang>/bin
 [ksu-nova]   note        : CONFIG_KSU must still be =y in out/.config after
 [ksu-nova]                 'make olddefconfig'; the workflow asserts that,

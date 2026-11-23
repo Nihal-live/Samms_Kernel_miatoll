@@ -25,9 +25,11 @@ tree:
    an earlier setup script is normalised to `CONFIG_KSU`.
 3. **Apply the 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
    exist before 5.10), port KPM's three 5.10 assumptions (see [KPM](#kpm)),
-   lower the CPU-spoof guard from 5.10 to 4.14 and compile the parts of
-   `cpu_spoof.c` that assume a 4.18+ vDSO out of the build. See
-   [CPU identity spoofing](#cpu-identity-spoofing).
+   lower the CPU-spoof guard from 5.10 to 4.14, compile the parts of
+   `cpu_spoof.c` that assume a 4.18+ vDSO out of the build, and swap the
+   >= 5.10-only `selinux_hide.c` for the 4.14 edition described in
+   [SELinux hiding and AVC log spoofing](#selinux-hiding-and-avc-log-spoofing).
+   See also [CPU identity spoofing](#cpu-identity-spoofing).
 4. **Insert the manual hook call sites** a 4.14 kernel needs — see
    [Hooks](#hooks).
 5. **Inject the defconfig symbols** — `CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
@@ -49,14 +51,14 @@ compiled in unconditionally; only ADB root and KPM have Kconfig switches.
 | Kernel umount | yes | via Nova's `path_umount()` shim for < 5.9 |
 | sulog (root logging) | yes | runtime toggle |
 | ADB root | yes | `CONFIG_KSU_FEATURE_ADBROOT=y` |
-| SELinux hide | **no** | `selinux_hide` reimplements selinuxfs against `struct selinux_policy` and other 5.6+ SELinux internals; its init call is `#if`d at 5.10 and this tree has no `selinux_policy`. Porting it means rewriting 400 lines of policy internals — not attempted. |
+| Hide SELinux modification | yes, 4.14 edition | upstream's `selinux_hide.c` needs `struct selinux_policy` (5.6+); this build snapshots the pristine policy instead and serves it back. See [SELinux hiding and AVC log spoofing](#selinux-hiding-and-avc-log-spoofing). |
 | Shell su (adb only) | yes | runtime toggle |
 | Mount hide | yes | needs `mount_list` / `mount_list_lock`, present in this tree |
 | App profile / allowlist / manager tracking | yes | |
 | CPU identity spoofing | yes | MIDR + BogoMIPS + ELF `hwcap`; see [CPU identity spoofing](#cpu-identity-spoofing) |
 | Extensions (version spoof, dynamic manager, unmount paths) | yes | |
 | **KPM** (load external kernel modules) | **yes, needs the image patch** | `CONFIG_KPM=y` compiles SukiSU's bridge; `scripts/kpm-patch.sh` injects KernelPatch into the image. See [KPM](#kpm). |
-| **AVC log spoofing** | **no** | SUSFS-only (`susfs_set_avc_log_spoofing()`) |
+| **AVC log spoofing** | **yes, native** | the same `avc_dump_query()` rewrite SUSFS performs, driven over the SUSFS `reboot()` supercall — no SUSFS code in the build |
 | **SUSFS** | **no** | see below |
 
 ## KPM
@@ -194,6 +196,80 @@ fast path is already what this device reports.
 If a symbol is missing the call returns `-ENXIO` instead of pretending to
 succeed, so a partial spoof is visible rather than silent.
 
+## SELinux hiding and AVC log spoofing
+
+Both toggles read *"Kernel does not support this feature"* in the manager on a
+stock 4.14 + SukiSU-Nova build, for two unrelated reasons:
+
+- **Hide SELinux modification** is a >= 5.10 feature upstream.
+  `kernel/ksu_main.c` wraps both `#include "feature/selinux_hide.c"` and
+  `ksu_selinux_hide_init()` in
+  `#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)`, so on 4.14 the
+  `KSU_FEATURE_SELINUX_HIDE` handler is never registered and the manager is
+  told the feature does not exist. The file itself is built around
+  `struct selinux_policy` (5.6+) and duplicates the policydb.
+- **AVC log spoofing** exists only behind `CONFIG_KSU_SUSFS`: the
+  `CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING` case sits in the
+  `#ifdef CONFIG_KSU_SUSFS` block of `kernel/supercall/dispatch.c`, and nothing
+  answers it with SUSFS off. `grep -r avc_log` in the clone finds that single
+  place and nothing else.
+
+### What this build does instead
+
+Both are re-implemented in the kernel tree — no SUSFS, no 5.10 requirement:
+
+| Piece | Where | Role |
+| --- | --- | --- |
+| `ksu_hide_compat.c` | `security/selinux/` | both features, built with `CONFIG_KSU` |
+| `ksu_hide_compat.h` | `include/linux/` | prototypes for the four call sites |
+| `selinux_hide_414.c` | SukiSU-Nova `kernel/feature/` | registers `KSU_FEATURE_SELINUX_HIDE` |
+
+**Hide SELinux modification.** At the init second stage — the one moment where
+the stock policy is loaded and `apply_kernelsu_rules()` has not run yet — the
+policy is read once (`security_read_policy()`) and kept. While the feature is
+on:
+
+- `security_read_policy()` hands out the snapshot instead of the live policy,
+  so `/sys/fs/selinux/policy` — and its inode size, through
+  `security_policydb_len()` — is the stock one;
+- the `policyload` counter in `/sys/fs/selinux/status`, in the netlink
+  notification and in `security_load_policy()` is masked to the pristine value,
+  so KernelSU's reload is invisible.
+
+Enabling is instant: the snapshot exists from every boot, so nothing waits for
+a reboot. If the second-stage hook did not run (feature forced before it), the
+manager gets `-EAGAIN` and the message says to save and reboot, exactly as
+upstream words it.
+
+This is a deliberate subset of upstream: it hides the two things a detector
+reads back — the policy dump and the load counter — not the per-object
+`sidtab` queries upstream also redirects (`getfilecon()` on a path KernelSU
+touched still answers from the live policy). A full port would mean duplicating
+the policydb *and* the sidtab on 4.14, which upstream's code does not do either.
+
+**AVC log spoofing.** `avc_dump_query()` formats every denial. When the
+*target* of a denial is KernelSU's own domain (`u:r:ksu:s0` in this tree), the
+context is replaced with `u:r:priv_app:s0:c512,c768` — the same rewrite
+susfs4ksu's hook performs — so an `avc: denied` line in `dmesg`/`logcat` does
+not point at root. The SID is resolved on the first `ENABLE_AVC_LOG_SPOOFING`
+command, never at boot.
+
+The manager drives that toggle over the SUSFS `reboot()` supercall, so
+`kernel/reboot.c` answers the four commands it needs — `SHOW_VERSION`
+(`v2.4.0`), `SHOW_VARIANT` (`NON-GKI`), `SHOW_ENABLED_FEATURES`
+(`CONFIG_KSU_SUSFS_AVC_LOG_SPOOFING`) and `ENABLE_AVC_LOG_SPOOFING` — on
+`reboot(0xDEADBEEF, 0xFAFAFAFA, cmd, &info)` from uid 0. Without them the
+manager cannot know the kernel has anything to offer and greys the row out. The
+version and variant strings are the values the manager parses; they are not a
+claim that SUSFS is present, and every other SUSFS command is unanswered.
+
+### What the device should log
+
+- init second stage: `selinux_hide: pristine policy captured` plus
+  `ksu: selinux_hide: pristine policy captured, NNNNN bytes, policyload 1`
+- toggling hide: `ksu: selinux_hide: enabled`
+- first AVC toggle: `ksu: avc spoof: masking denials targeting sid NNN`
+
 ## Why no SUSFS
 
 SUSFS is a kernel-side root-hiding layer, and there is no upstream branch that
@@ -281,6 +357,13 @@ The workflow
   `out/.config` after `olddefconfig`,
 - asserts `kernel.release` still contains `SKYNET`,
 - packages an AnyKernel3 ZIP.
+
+The dry run additionally asserts that the SELinux work is in place:
+`ksu_hide_compat.c` is in the SELinux Makefile, `avc_dump_query()` calls
+`ksu_avc_log_spoof_matches()`, `security_read_policy()` and
+`security_policydb_len()` consult the snapshot, `reboot()` calls
+`ksu_avc_spoof_reboot()`, and the clone includes
+`feature/selinux_hide_414.c` instead of skipping the feature.
 
 It proves the kernel **compiles and links with root integrated**. It does not
 prove the kernel boots, that `su` works on your firmware, or that the manager

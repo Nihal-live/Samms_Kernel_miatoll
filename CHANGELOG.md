@@ -133,6 +133,28 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 - **Not boot-tested.** KernelPatch accepts and patches this 4.14 image, which is the last thing
   a build can prove; whether the loader starts on the device is not something CI can answer.
 
+#### Hide SELinux modification and AVC log spoofing (UNTESTED)
+
+- Both manager toggles read "Kernel does not support this feature" on the device, and both had a
+  concrete reason: `kernel/ksu_main.c` only includes `feature/selinux_hide.c` and only calls
+  `ksu_selinux_hide_init()` on `>= 5.10` (upstream's file needs `struct selinux_policy`, 5.6+), and
+  AVC log spoofing exists only inside the `CONFIG_KSU_SUSFS` block of
+  `kernel/supercall/dispatch.c`.
+- `security/selinux/ksu_hide_compat.c` now implements both for 4.14, gated on `CONFIG_KSU`:
+  - *hide*: the pristine policy is snapshotted at the init second stage, before
+    `apply_kernelsu_rules()`, and `security_read_policy()`/`security_policydb_len()` serve it back
+    while the feature is on, together with a masked `policyload` counter. Enabling is instant.
+  - *AVC*: `avc_dump_query()` logs `u:r:priv_app:s0:c512,c768` instead of the KernelSU domain when
+    the denial targets it — the rewrite susfs4ksu performs — and `reboot()` answers the four SUSFS
+    commands the manager needs (`SHOW_VERSION`, `SHOW_VARIANT`, `SHOW_ENABLED_FEATURES`,
+    `ENABLE_AVC_LOG_SPOOFING`) with no SUSFS code in the tree.
+- SukiSU-Nova's `feature/selinux_hide_414.c` registers `KSU_FEATURE_SELINUX_HIDE` and takes the
+  snapshot from the existing second-stage hook, so the manager's row is no longer greyed out.
+- Deliberate limit, documented in `docs/KSU-NOVA.md`: the policy dump and the load counter are
+  hidden, not upstream's sidtab-level query redirection (`getfilecon()` still answers from the live
+  policy).
+- **Not boot-tested.**
+
 #### SELinux hide stays unsupported (by construction, not by omission)
 
 - **SELinux hide** (`selinux_hide`, what the settings screen calls "Hide SELinux modification")
