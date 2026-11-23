@@ -300,14 +300,36 @@ of what is published for 4.14:
 | `xiaofan6ya/agate-bakasu-susfs`, `feature/susfs-2.3.4.14-port` | **v2.3.0** | **yes — 4.14.336, device-verified** (boots, root works, manager reports v2.3.0) | yes | **used** |
 | `wxx9248/susfs4ksu` | v2.3.0 | 4.9 only | yes | rejected: wrong line, no 4.14 verification |
 | `ShirkNeko/SukiSU_patch`, `3.10/…v2.4.0` | v2.4.0 | 3.10 only | yes | rejected: wrong line; the one 4.14 file in that bundle is the KernelSU hook glue, not SUSFS |
+| a device kernel pairing SukiSU-Nova v3.0.0 with a **v2.4.0** non-GKI 4.14 port (XDA, SM-A226B, 4.14.186, Nov 2026) | v2.4.0 | yes — one device | yes | rejected: it ships as one device's kernel, not as a portable patch stack; nothing to apply, and nothing to verify against 4.14.357 |
 | `Bias8145/KsuNext-susfs-msm4.14` | v1.5.3 | yes | no | rejected: v1.x ABI |
 | `zzh20188/GKI_KernelSU_SUSFS` releases | v2.2–v2.3 | GKI only | yes | rejected: GKI tree |
 
-The chosen port is the only candidate that is **both** v2.x **and** verified
-booting on non-GKI 4.14 hardware, and its integration patch was generated
-against 4.14.357 — the exact base of this tree. Its sources apply here without
-a single rejected hunk, which is as close to a compatibility proof as you get
-before flashing.
+The chosen port is the only candidate that is **both** v2.x **and** published
+as a patch stack that is verified booting on non-GKI 4.14 hardware, and its
+integration patch was generated against 4.14.357 — the exact base of this
+tree. Its sources apply here without a single rejected hunk, which is as
+close to a compatibility proof as you get before flashing.
+
+### The known bootloop, and why this build does not carry it
+
+Upstream's own documentation has one open, device-class warning:
+
+> **Known Issues** — `mnt_id_reorder` feature causes bootloop for non-gki
+> devices, more test is needed.
+> — `gitlab.com/simonpunk/susfs4ksu`, README
+
+That is the failure this build is arranged to avoid. `mnt_id_reorder` was a
+v1.x feature: it rewrote `mnt_id`s across the mount tree at boot, which is
+exactly the sort of global surgery that hangs a device whose init depends on
+those ids. v2.x dropped it; the v2.3.0 sources here carry no `reorder` code at
+all and spoof the mount id *per entry* instead (`spoofed_mnt_id`, filled by
+`susfs_get_non_sus_mnt_id_from_mnt()`), which is a read-time substitution, not
+a rewrite. The kernel-side integration adds no boot-time renumbering either:
+the only change next to boot-critical code is the `fs/super.c` minor-number
+branch, and it keeps 4.14's own allocator.
+
+Feature creep is the other bootloop source, and that is why `SUS_MAP` and
+`OPEN_REDIRECT` stay off rather than being wired to half a port.
 
 ### What is enabled
 
@@ -350,9 +372,11 @@ and `PRIORITY_UID_FILTER` stayed off, `susfs_spoof_uname()` is inside
 then proves it **compiles and links**.
 
 That is all it proves. **SUSFS has not been boot-tested on miatoll** by this
-tree: the port's evidence comes from a different 4.14.336 device. Flash it with
-a known-good boot image at hand, and expect the default (root-only) image to
-stay the safe choice until someone reports a boot.
+tree: the port's evidence comes from a different 4.14.336 device, and the
+community reports that do exist are for that class of device (an SM-A226B on
+4.14.186 with a v2.4.0 port, an agate on 4.14.336 with v2.3.0), not for
+miatoll. Flash it with a known-good boot image at hand, and expect the default
+(root-only) image to stay the safe choice until someone reports a boot.
 
 ### What the manager should show
 
