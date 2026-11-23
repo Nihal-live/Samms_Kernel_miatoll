@@ -205,6 +205,42 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      - name: Publish stage logs to a branch on failure
+        # Same reason as the other pipeline: the job log and the artefact zip
+        # are served from storage that not every client can reach, and a
+        # failed stage is exactly when the text matters. A throwaway branch is
+        # reachable with plain git.
+        if: failure()
+        run: |
+          set -euo pipefail
+          [ -d "$LOG_DIR" ] || { echo "no stage logs captured"; exit 0; }
+          mkdir -p /tmp/ci-action-log
+          {
+            echo "# KernelSU_Action_V2 stage logs for run $GITHUB_RUN_ID"
+            echo
+            echo "commit ${GITHUB_SHA}, action ${ACTION_REF}"
+            for f in "$LOG_DIR"/*.log; do
+              [ -f "$f" ] || continue
+              echo
+              echo "## $(basename "$f")"
+              echo
+              echo '```'
+              tail -n 200 "$f"
+              echo '```'
+            done
+          } > /tmp/ci-action-log/stage-logs.md
+          cd /tmp/ci-action-log
+          git init -q .
+          git checkout -q -b ci-action-log
+          git config user.name  "skynet-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git add stage-logs.md
+          git commit -q -m "ci: KernelSU_Action_V2 stage logs for $GITHUB_RUN_ID"
+          git push -q --force \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            ci-action-log
+          echo "pushed to branch ci-action-log"
+
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
