@@ -37,8 +37,9 @@ on:
         required: false
         default: true
 
+# contents: write is for the stage-log branch; nothing else is pushed.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ksu-action-${{ github.ref }}
