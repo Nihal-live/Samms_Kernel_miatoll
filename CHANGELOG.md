@@ -105,6 +105,12 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   Makefile now probes `include/linux/sched.h` for it, like its other vendor-backport probes); and
   the truncate handler lookup, since `__arm64_sys_*` wrappers only exist from 4.17 — the bridge
   now falls back to `sys_call_table[__NR_truncate]`, then `sys_truncate`/`SyS_truncate`.
+- The first build booted with KPM unavailable, and the device said why:
+  `KP syscall has_wrapper: 0`, `KP sukisu_kpm_supercall_install done: -95`. The
+  KernelPatch payload only installs its KPM channel when it can see the 4.17+
+  `__arm64_sys_*` wrappers, so `arch/arm64/kernel/kp_syswrap.c` now provides
+  `__arm64_sys_truncate` and `__arm64_sys_openat` on 4.14 (see docs/KSU-NOVA.md). The
+  build fails if LTO drops either name from `System.map`.
 - New [`scripts/kpm-patch.sh`](scripts/kpm-patch.sh) does the half that is not in the kernel: it
   runs ShirkNeko's `kptools -p` (pinned SukiSU_patch commit) on the built `Image` and rebuilds
   `Image.gz-dtb` as `gzip(patched Image) + the dtb blob` — taken from the original `Image.gz-dtb`

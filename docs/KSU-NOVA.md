@@ -107,6 +107,44 @@ With upstream's `KSU_CAN_USE_KPM` guard (>= 4.4) the KPM sources compile on
 The syscall-table lookup is deliberate: it reaches KernelPatch whether it hooks
 the table entry or the function body.
 
+### The two symbols KernelPatch looks for
+
+The bridge above is only half of KPM; the KernelPatch payload in the image
+installs the other half, and it refuses to do so on this kernel:
+
+```c
+int sukisu_kpm_supercall_install(void)
+{
+    if (!has_syscall_wrapper) return -EOPNOTSUPP;          /* 4.14 stops here */
+    addr = kallsyms_lookup_name("__arm64_sys_truncate");   /* 4.17+ name */
+    ...
+    hook_wrap1((void *)addr, before_supercall, 0, 0);
+}
+```
+
+`has_syscall_wrapper` is set by looking for `__arm64_sys_openat`. Both that and
+`__arm64_sys_truncate` arrived with the `SYSCALL_DEFINE` wrapper generation in
+4.17, so the payload logs
+
+```
+KP syscall has_wrapper: 0
+KP sukisu_kpm_supercall_install done: -95
+```
+
+and the manager greys KPM out — which is exactly what the first build did on the
+device, with everything else working.
+
+`arch/arm64/kernel/kp_syswrap.c` (built only with `CONFIG_KPM`) now defines those
+two names. Nothing in the kernel calls them: `sys_call_table` still points at
+`sys_truncate`/`sys_openat`, and the only caller of `__arm64_sys_truncate` is the
+KPM bridge, which the payload intercepts before the first instruction runs. If
+the hook is not installed, the stub answers `-ENOSYS` and the bridge reports
+"unavailable" — the same state as without the shim, so the failure mode is a
+greyed-out panel, not a wrong answer and not a crash. The stubs start with
+relocatable nops (an inline hook rewrites the first instructions of its target)
+and their addresses are kept in a `__used` array so LTO cannot drop them; the
+build asserts both names are in `out/System.map`.
+
 ### What can still go wrong
 
 - **KernelPatch has to accept the image.** It is a binary patcher, so it parses
