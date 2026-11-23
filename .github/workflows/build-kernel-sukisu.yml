@@ -11,7 +11,13 @@ name: Build SKYNET kernel + SukiSU-Nova root (AnyKernel3 ZIP)
 #                                the four 4.14 hook call sites, the two Nova
 #                                4.14 fixes, and the CONFIG_KSU* symbols
 #
-# No SUSFS in this flavour; KPM is on and gets a KernelPatch image patch.
+# Root only by default. KPM is on and gets a KernelPatch image patch.
+#
+# `susfs: true` builds the second product instead: the same tree plus the
+# 4.14 port of SUSFS v2.3.0 (scripts/ksu-nova-setup.sh section 3.7), which
+# is what the SukiSU-Nova manager's hiding panels drive. It is a separate
+# image because SUSFS patches fs/namei.c, fs/namespace.c, fs/stat.c and
+# fs/super.c -- a bad port there is a bootloop, not a missing feature.
 # See docs/KSU-NOVA.md.
 #
 # The build is untested on hardware: the job proves it compiles and that
@@ -41,6 +47,14 @@ on:
         description: Optional tag for a GitHub Release (empty = artifact only)
         required: false
         default: ''
+      susfs:
+        description: 'Add SUSFS v2.3.0 root hiding (separate product, experimental)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
       no_polly:
         description: Disable CONFIG_LLVM_POLLY (needed for toolchains without Polly)
         required: true
@@ -53,6 +67,7 @@ on:
     paths:
       - '.github/workflows/build-kernel-sukisu.yml'
       - 'scripts/ksu-nova-setup.sh'
+      - 'ci/susfs/**'
       - 'scripts/build.sh'
       - 'scripts/package-anykernel.sh'
       - 'arch/arm64/configs/vendor/xiaomi/miatoll_defconfig'
@@ -107,6 +122,7 @@ jobs:
       - name: Apply SukiSU-Nova integration
         env:
           KSU_REF: ${{ inputs.ksu_ref }}
+          KSU_SUSFS: ${{ inputs.susfs == 'true' && '1' || '0' }}
         run: |
           chmod +x scripts/ksu-nova-setup.sh
           ./scripts/ksu-nova-setup.sh
@@ -117,11 +133,17 @@ jobs:
             echo "| --- | --- |"
             echo "| SukiSU-Nova | \`$(git -C KernelSU rev-parse HEAD)\` |"
             echo "| defconfig | \`$(grep -cE '^CONFIG_KSU[A-Z_0-9]*=y$' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig) CONFIG_KSU* options\` |"
-            echo "| KPM | off |"
-            echo "| SUSFS | not included |"
+            echo "| KPM | on (CONFIG_KPM=y) |"
+            if [ "${KSU_SUSFS:-0}" = "1" ]; then
+              echo "| SUSFS | v2.3.0 (4.14 port, sus_path/sus_mount/sus_kstat/uname/cmdline) |"
+            else
+              echo "| SUSFS | not included |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Inspect applied tree
+        env:
+          KSU_SUSFS: ${{ inputs.susfs == 'true' && '1' || '0' }}
         run: |
           echo "--- KSU wiring ---"
           ls -l drivers/kernelsu
@@ -222,10 +244,21 @@ jobs:
             || { echo "::error::CONFIG_KPM=y did not survive olddefconfig"; exit 1; }
           grep -qx 'CONFIG_KALLSYMS_ALL=y' out/.config \
             || { echo "::error::KPM needs CONFIG_KALLSYMS_ALL=y"; exit 1; }
-          if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
-            echo "::error::SUSFS symbols found but SUSFS is not part of this build"; exit 1
+          if [ "${KSU_SUSFS:-0}" = "1" ]; then
+            grep -qx 'CONFIG_KSU_SUSFS=y' out/.config \
+              || { echo "::error::CONFIG_KSU_SUSFS=y did not survive olddefconfig"; exit 1; }
+            grep -qx 'CONFIG_KSU_SUSFS_SUS_PATH=y' out/.config \
+              || { echo "::error::SUSFS SUS_PATH was dropped"; exit 1; }
+            if grep -qx 'CONFIG_KSU_SUSFS_SUS_MAP=y' out/.config; then
+              echo "::error::SUS_MAP has no /proc/pid/maps port in this build"; exit 1
+            fi
+            echo "CONFIG_KSU, CONFIG_KPM and the SUSFS symbols survived"
+          else
+            if grep -q '^CONFIG_KSU_SUSFS' out/.config; then
+              echo "::error::SUSFS symbols found but SUSFS is not part of this build"; exit 1
+            fi
+            echo "CONFIG_KSU and CONFIG_KPM survived; no SUSFS symbols"
           fi
-          echo "CONFIG_KSU and CONFIG_KPM survived; no SUSFS symbols"
 
           echo "--- kernel.release ---"
           REL="$(cat out/include/config/kernel.release 2>/dev/null || printf 'unknown')"
@@ -326,8 +359,10 @@ jobs:
 
       - name: Package AnyKernel3 ZIP
         id: package
+        env:
+          KSU_SUSFS: ${{ inputs.susfs == 'true' && '1' || '0' }}
         run: |
-          NAME="skynet-17-sukisu-nova-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+          NAME="skynet-17-sukisu-nova$( [ "${KSU_SUSFS:-0}" = "1" ] && printf -- "-susfs" )-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}"
           ./scripts/package-anykernel.sh --name "$NAME" \
             --out "$GITHUB_WORKSPACE/$NAME.zip"
           sha256sum "$NAME.zip" | tee "$NAME.zip.sha256"
@@ -335,7 +370,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: skynet-kernel-sukisu-nova-zip
+          name: skynet-kernel-sukisu-nova${{ inputs.susfs == 'true' && '-susfs' || '' }}-zip
           path: |
             ${{ steps.package.outputs.zip }}
             ${{ steps.package.outputs.zip }}.sha256
@@ -356,8 +391,9 @@ jobs:
             | item | value |
             | --- | --- |
             | SukiSU-Nova | committed in `scripts/ksu-nova-setup.sh` (`KSU_REF`) |
-            | root hiding | none (no SUSFS in this flavour) |
-            | KPM | off |
+            | root hiding | ${{ inputs.susfs == 'true' && 'SUSFS v2.3.0 (4.14 port)' || 'none' }} |
+            | SUSFS | ${{ inputs.susfs == 'true' && 'sus_path, sus_mount, sus_kstat, spoof_uname, cmdline', sus_map/open_redirect/priority_uid_filter off' || 'not included' }} |
+            | KPM | on (`CONFIG_KPM=y` + KernelPatch image patch) |
             | source | `${{ github.sha }}` on `${{ github.ref_name }}` |
 
             **Not boot-tested on any miatoll device.** Back up `boot`, `dtbo`,

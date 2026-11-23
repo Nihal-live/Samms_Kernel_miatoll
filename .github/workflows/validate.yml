@@ -40,6 +40,98 @@ jobs:
       - name: Markdown links
         run: python3 scripts/check-links.py
 
+  susfs-integration:
+    name: SUSFS v2.3.0 integration (dry run)
+    # The SUSFS build is a separate product, so it gets its own dry run: it
+    # applies the same two-patch stack a real build would, on a clean checkout,
+    # and checks the result. A rejected hunk, a missing shim or an idr.h-style
+    # API mismatch shows up here in a minute instead of after a 40-minute
+    # build -- and, on a device, instead of as a bootloop.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Apply integration with SUSFS
+        run: KSU_SUSFS=1 ./scripts/ksu-nova-setup.sh
+
+      - name: Assert what was applied
+        run: |
+          set -euo pipefail
+          # No rejected hunks anywhere: a fuzz-3 patch that lands in the wrong
+          # place is the failure mode this whole job exists to catch.
+          test -z "$(find fs include kernel mm security -name '*.rej' -print -quit)"
+
+          # The three SUSFS sources and the shim.
+          test -s fs/susfs.c
+          grep -q 'susfs_mnt_id_backup' include/linux/mount.h
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          grep -q 'obj-$(CONFIG_KSU_SUSFS) += susfs_compat.o' fs/Makefile
+
+          # The four v2.4 entry points SukiSU-Nova calls and v2.3.0 lacks, plus
+          # susfs_ends_with() (v2.3.0 ships only the mirror) and the AVC flag.
+          for sym in susfs_add_sus_type susfs_add_sus_avd_allowed_by_type \
+                     susfs_set_current_proc_no_su \
+                     susfs_set_current_proc_umounted_for_zygote_next \
+                     susfs_ends_with susfs_is_avc_log_spoofing_enabled; do
+            grep -q "$sym" fs/susfs_compat.c \
+              || { echo "::error::fs/susfs_compat.c does not provide $sym"; exit 1; }
+          done
+          grep -q 'susfs_ends_with' include/linux/susfs.h \
+            || { echo "::error::susfs_ends_with() is not declared for Nova"; exit 1; }
+
+          # The 4.14 IDA allocator survives: the port adds a branch, it does
+          # not replace ida_pre_get()/ida_get_new_above() with the 4.19 API.
+          # (lib/idr.c does carry ida_alloc_range() on this tree, so the check
+          # has to be about the call site, not the helper's existence.)
+          grep -q 'ida_pre_get' fs/super.c \
+            || { echo "::error::get_anon_bdev() lost the 4.14 IDA API"; exit 1; }
+          if grep -q 'ida_alloc_range' fs/super.c; then
+            echo "::error::get_anon_bdev() was switched to a 4.19+ IDA call"; exit 1
+          fi
+
+          # What the build enables, and what it must not.
+          grep -qx 'CONFIG_KSU_SUSFS=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -qx 'CONFIG_KSU_SUSFS_SUS_PATH=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          grep -qx 'CONFIG_KSU_SUSFS_SUS_MOUNT=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          for sym in SUS_MAP OPEN_REDIRECT PRIORITY_UID_FILTER; do
+            grep -qx "# CONFIG_KSU_SUSFS_$sym is not set" \
+                 arch/arm64/configs/vendor/xiaomi/miatoll_defconfig \
+              || { echo "::error::CONFIG_KSU_SUSFS_$sym must stay off"; exit 1; }
+          done
+
+          # SUSFS owns the AVC supercall in this build, so reboot() must not
+          # answer it; the avc_dump_query() rewrite is still ours.
+          if grep -q 'ksu_avc_spoof_reboot' kernel/reboot.c; then
+            echo "::error::reboot() answers a supercall SUSFS now owns"; exit 1
+          fi
+          grep -q 'ksu_avc_log_spoof_matches(tsid)' security/selinux/avc.c \
+            || { echo "::error::avc_dump_query() has no AVC log spoofing"; exit 1; }
+
+          # The uname spoof has to sit inside newuname(), where sys.c's own
+          # fake-uname block also lives -- an anchor miss here is silent.
+          awk 'BEGIN{f=0;found=0}
+               /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(newuname,")) f=1; next }
+               f && index($0, "susfs_spoof_uname(") { found=1 }
+               END { exit !found }' kernel/sys.c \
+            || { echo "::error::susfs_spoof_uname() is not in newuname()"; exit 1; }
+
+          # ksu_handle_setresuid() only exists in this flavour, so it must be
+          # hooked now -- inside setresuid(), not setregid().
+          grep -q 'ksu_handle_setresuid' kernel/sys.c \
+            || { echo "::error::the SUSFS build must hook setresuid"; exit 1; }
+          if awk 'BEGIN{f=0;found=0}
+                  /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
+                  f && index($0, "ksu_handle_setresuid(") { found=1 }
+                  END { exit !found }' kernel/sys.c; then
+            echo "::error::setresuid hook landed in setregid()"; exit 1
+          fi
+
+          # KPM must still be on: SUSFS does not replace it.
+          grep -qx 'CONFIG_KPM=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          echo "SUSFS v2.3.0 integration verified"
+
   integration:
     name: SukiSU-Nova integration (dry run)
     # Applies the integration to a clean checkout and checks the result. No
