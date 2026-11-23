@@ -9,7 +9,9 @@ SukiSU-Nova tree, same KPM step — with four small additions carried in
 **Status: it works.** Run
 [`45101073164`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45101073164)
 (20m51s, action commit `26c1b95532` + this patch) produced `Image`, `Image.gz`
-and a patched `Image.gz-dtb`, with the KernelPatch payload in the image.
+and a patched `Image.gz-dtb`, with the KernelPatch payload in the image; run
+[`45104610003`](https://github.com/Nihal-live/Samms_Kernel_miatoll/actions/runs/45104610003)
+adds the flashable `AnyKernel3-*.zip` (21 MB) next to them.
 
 ## What the patch adds, and why
 
