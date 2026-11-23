@@ -107,10 +107,18 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   now falls back to `sys_call_table[__NR_truncate]`, then `sys_truncate`/`SyS_truncate`.
 - New [`scripts/kpm-patch.sh`](scripts/kpm-patch.sh) does the half that is not in the kernel: it
   runs ShirkNeko's `kptools -p` (pinned SukiSU_patch commit) on the built `Image` and rebuilds
-  `Image.gz-dtb` as `gzip(patched Image) + the original dtb blob`, then verifies the header magic,
-  the KernelPatch marker and that `Image.gz` decompresses to the patched image.
+  `Image.gz-dtb` as `gzip(patched Image) + the dtb blob` — taken from the original `Image.gz-dtb`
+  when make built it, from `dtb.img` otherwise — then verifies the arm64 header magic, the
+  payload's own `KP1158` preset magic, that the file grew by at least the payload size, and that
+  `Image.gz` decompresses to the patched `Image`.
+- `kptools` is called directly rather than through the bundle's `patch_linux`, which in the pinned
+  bundle hands `kptools` an *empty* embedded payload (16 bytes, `kpimg version: 0`) through a
+  memfd and still reports success. That was a real failure here: the first run produced an image
+  whose KPM panel could never have worked.
 - The workflow runs it after the build and before packaging, and asserts `CONFIG_KPM=y` and
   `CONFIG_KALLSYMS_ALL=y` survived `olddefconfig`.
+- The step is also carried into the KernelSU_Action_V2 pipeline, which delegates to the same
+  script; see `ci/ksu-action-v2/`.
 
 #### SELinux hide stays unsupported (by construction, not by omission)
 

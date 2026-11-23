@@ -159,6 +159,35 @@ symbol in the commit message.
 | `package-anykernel.sh`: "no kernel image found" | Build `Image.gz-dtb` first; check `out/arch/arm64/boot/`. |
 | Build succeeds but device bootloops | Vendor/firmware mismatch or wrong AnyKernel3 block; see [`docs/DEVICES.md`](DEVICES.md). |
 
+## 8a. KPM: what fails, and what it means
+
+`scripts/kpm-patch.sh` runs after the link and before packaging, because the
+KernelPatch loader cannot be compiled in. Every message below came from a real
+run of this tree, in the order a build hits them.
+
+| Message | Meaning | Fix |
+| --- | --- | --- |
+| `HOSTCC scripts/basic/fixdep` then `.../clang/bin/ld: ... unknown type [0x13] section '.relr.dyn'` and `collect2: error: ld returned 1 exit status`, reported as `defconfig generation failed` | the host link used the toolchain's own GNU `ld` (proton-clang ships one, and its `bin/` is first in `PATH`) instead of the system binutils, and that `ld` predates current glibc | add `HOSTLDFLAGS=-B/usr/bin` to the make arguments (`EXTRA_CMDS` in KernelSU_Action_V2) so `gcc` links host tools with `/usr/bin/ld` |
+| `[-] .../image.c:81/get_kernel_info(); kernel primary entry: <hex>` | the file is not a raw arm64 `Image` -- a compressed `Image.gz`, a `boot.img`, or a truncated file. `patch_linux` prints this and still exits 0, so its status means nothing | patch `Image`; `kptools` exits 1 on the same input |
+| `[+] layout kimg: 0x0,<n>, kpimg: <off>,0x10` together with `[+] kpimg version: 0` | the 16-byte payload: `patch_linux` passed `kptools` an embedded `kpimg` through a memfd that resolved to an empty file, so the image was reported as patched with nothing in it | call `kptools -p -s <key> -i Image -k kpimg -o oImage` directly; check the payload first with `kptools -k kpimg -l` (`version=0xe00`, `config=android,release`) |
+| `oImage does not carry the KP1158 payload` | the payload was dropped (see the row above), or the image is not the one that was just patched | re-run the step; the magic is read from the `kpimg` that is actually used, so a newer payload needs no change here |
+| `Image only grew by N bytes, less than the M-byte payload` | the same failure, caught by size instead of by content | same |
+| `Image.gz no longer decompresses to Image` | the repack picked up mismatched files, usually a half-patched `out/` | `rm -rf out` and rebuild |
+| `no <out>/arch/arm64/boot/Image -- build the kernel before patching` | the step ran before the build | it is a post-build step; in KernelSU_Action_V2 it runs from `build.sh` after its output check |
+| `no kptools in .../.kpm-tools/kpm` / `cannot fetch ... at <sha>` | the tools were not fetched: no network, or `SUKISU_PATCH_REF` moved | re-run; the pin is `4ee085a39e3c`, do not float it |
+
+On the device, with a green build:
+
+- **The manager's KPM panel says unsupported.** The booted image is not the one
+  that was patched, or `CONFIG_KPM` did not survive `olddefconfig`. Both are
+  asserted in CI, so check that the flashed zip came from the green run.
+- **A `.kpm` module refuses to load.** It was built for another kernel version or
+  another subsystem layout; a 5.x module cannot load on 4.14. Build modules
+  against this tree's headers (`out/` after a full build).
+- **Random reboots after loading a module.** KPM executes third-party code in
+  kernel context by design; see the KPM section of
+  [`docs/KSU-NOVA.md`](KSU-NOVA.md). Keep a boot backup.
+
 ## 9. Clean up
 
 ```bash
