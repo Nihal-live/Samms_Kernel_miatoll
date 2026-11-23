@@ -16,14 +16,16 @@
 #   tree, i.e. the kernel calls ksu_handle_*() directly instead of relying on
 #   kprobes (kprobes are unreliable on 4.x).
 #
-#   No SUSFS. Root hiding (SUSFS) is deliberately *not* part of this kernel:
-#   it needs a kernel-side port that no upstream branch ships for 4.14 with the
-#   API SukiSU-Nova calls, and a half-ported root-hiding layer is exactly the
-#   kind of thing that turns a working root into an unstable device. What this
-#   script touches outside drivers/ is: the manual hook call sites (section
-#   4), the KPM syscall-wrapper stub (section 3.5) and the SELinux support
-#   file behind "hide SELinux modification" and AVC log spoofing (section
-#   3.6), which replaces SUSFS's share of those two features.
+#   Root only by default. What this script touches outside drivers/ is: the
+#   manual hook call sites (section 4), the KPM syscall-wrapper stub (section
+#   3.5) and the SELinux support file behind "hide SELinux modification" and
+#   AVC log spoofing (section 3.6), which replaces SUSFS's share of those two
+#   features on this kernel.
+#
+#   SUSFS is a second, separate product: KSU_SUSFS=1 adds the device-verified
+#   4.14 port of SUSFS v2.3.0 (section 3.7). It is off by default because it
+#   patches fs/namei.c, fs/namespace.c, fs/stat.c and fs/super.c -- a broken
+#   port there is a bootloop, not a missing feature.
 #
 # WHY A PINNED COMMIT
 #   `builtin` moves. Every KernelSU setup.sh ends its checkout with
@@ -53,6 +55,15 @@ KSU_REPO="${KSU_REPO:-https://github.com/SukiSU-Nova/SukiSU-Nova}"
 # makes the build non-reproducible and the log will say so.
 KSU_REF="${KSU_REF:-4bec532dd447e2852aa8932afa768255350c103a}"
 KSU_DIR="${KSU_DIR:-KernelSU}"
+
+# SUSFS is a second, separate product built from the same tree: it hooks
+# fs/, mm/ and security/, so a broken port is a bootloop, not a missing
+# feature. Off unless KSU_SUSFS=1; see section 3.7.
+KSU_SUSFS="${KSU_SUSFS:-0}"
+case "$KSU_SUSFS" in
+    0|1) ;;
+    *) printf 'KSU_SUSFS must be 0 or 1\n' >&2; exit 2 ;;
+esac
 
 DEFCONFIG="${DEFCONFIG:-arch/arm64/configs/vendor/xiaomi/miatoll_defconfig}"
 
@@ -804,6 +815,10 @@ cat > security/selinux/ksu_hide_compat.c <<'KSU_HIDE_C'
  *       rewrite below is the one susfs4ksu performs in avc_dump_query(), and
  *       the SUSFS reboot() supercall the manager drives it with is answered
  *       here so that no SUSFS code is needed.
+ *
+ * When SUSFS is part of the build (KSU_SUSFS=1), SUSFS owns the supercall and
+ * the enable flag; this file only supplies the avc_dump_query() rewrite and
+ * the SID it needs. Everything that would answer the supercall is compiled out.
  */
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -848,6 +863,9 @@ cat > security/selinux/ksu_hide_compat.c <<'KSU_HIDE_C'
 #define KSU_AVC_SPOOF_TCONTEXT		"u:r:priv_app:s0:c512,c768"
 #define KSU_AVC_SPOOF_TARGET_CONTEXT	"u:r:ksu:s0"
 
+static DEFINE_MUTEX(ksu_hide_lock);
+
+#ifndef CONFIG_KSU_SUSFS
 struct ksu_susfs_avc_log_spoofing {
 	bool enabled;
 	int err;
@@ -867,25 +885,17 @@ struct ksu_susfs_version {
 	char susfs_version[KSU_SUSFS_MAX_VERSION_BUFSIZE];
 	int err;
 };
-
-static DEFINE_MUTEX(ksu_hide_lock);
+#endif /* !CONFIG_KSU_SUSFS */
 
 /* ---- AVC log spoofing --------------------------------------------------- */
 
-static bool ksu_avc_spoof_on;
+/* The SID of KernelSU's own domain, resolved once the policy is loaded. */
 static bool ksu_avc_spoof_sid_valid;
 static u32 ksu_avc_spoof_sid;
 
-bool ksu_avc_log_spoof_matches(u32 tsid)
-{
-	return READ_ONCE(ksu_avc_spoof_on) && READ_ONCE(ksu_avc_spoof_sid_valid) &&
-	       tsid == READ_ONCE(ksu_avc_spoof_sid);
-}
-
-const char *ksu_avc_spoof_tcontext(void)
-{
-	return KSU_AVC_SPOOF_TCONTEXT;
-}
+#ifndef CONFIG_KSU_SUSFS
+static bool ksu_avc_spoof_on;
+#endif
 
 static int ksu_avc_spoof_resolve_sid(void)
 {
@@ -905,6 +915,35 @@ static int ksu_avc_spoof_resolve_sid(void)
 	pr_info("ksu: avc spoof: masking denials targeting sid %u\n", sid);
 	return 0;
 }
+
+bool ksu_avc_log_spoof_matches(u32 tsid)
+{
+#ifdef CONFIG_KSU_SUSFS
+	extern bool susfs_is_avc_log_spoofing_enabled;
+
+	/*
+	 * SUSFS owns the toggle in this build: its own
+	 * susfs_set_avc_log_spoofing() writes this flag. The SID is resolved at
+	 * the init second stage, where the policy is already loaded.
+	 */
+	if (!READ_ONCE(susfs_is_avc_log_spoofing_enabled))
+		return false;
+#else
+	if (!READ_ONCE(ksu_avc_spoof_on))
+		return false;
+#endif
+	if (!READ_ONCE(ksu_avc_spoof_sid_valid))
+		return false;
+
+	return tsid == READ_ONCE(ksu_avc_spoof_sid);
+}
+
+const char *ksu_avc_spoof_tcontext(void)
+{
+	return KSU_AVC_SPOOF_TCONTEXT;
+}
+
+#ifndef CONFIG_KSU_SUSFS
 
 static void ksu_susfs_show_version(void __user *argp)
 {
@@ -1020,6 +1059,8 @@ bool ksu_avc_spoof_reboot(int magic1, int magic2, unsigned int cmd,
 	return true;
 }
 
+#endif /* !CONFIG_KSU_SUSFS */
+
 /* ---- hiding KernelSU's SELinux modifications ---------------------------- */
 
 static void *ksu_policy_snapshot;
@@ -1046,8 +1087,8 @@ size_t ksu_selinux_hide_snapshot_len(void)
 
 /*
  * Snapshot the policy that is live right now. Called from the init second
- * stage, before apply_kernelsu_rules(), and again when the manager enables the
- * feature in case the first call came too early (policy not loaded yet).
+ * stage, before apply_kernelsu_rules(), which is the last moment the policy is
+ * still the stock one.
  */
 int ksu_selinux_hide_capture(void)
 {
@@ -1098,6 +1139,15 @@ int ksu_selinux_hide_capture(void)
 
 	pr_info("ksu: selinux_hide: pristine policy captured, %zu bytes, policyload %u\n",
 		len, ksu_policy_snapshot_policyload);
+
+	/*
+	 * The policy is loaded now, so this is the first point where KernelSU's
+	 * domain has a SID. AVC log spoofing needs it, and resolving here keeps
+	 * the audit path free of anything that can sleep.
+	 */
+	if (!READ_ONCE(ksu_avc_spoof_sid_valid))
+		ksu_avc_spoof_resolve_sid();
+
 	ret = 0;
 out:
 	mutex_unlock(&ksu_hide_lock);
@@ -1347,6 +1397,7 @@ void ksu_selinux_hide_rewrite_status(struct selinux_state *state, u32 policyload
 KSU_STATUS_C
 fi
 
+if [[ "$KSU_SUSFS" -eq 0 ]]; then
 python3 - "kernel/reboot.c" <<'PY'
 import sys
 
@@ -1404,6 +1455,7 @@ src = once(
 
 open(path, "w").write(src)
 PY
+fi  # KSU_SUSFS == 0
 
 # ---- the SukiSU-Nova side: the 4.14 feature implementation --------------------
 
@@ -1600,7 +1652,9 @@ grep -q 'ksu_hide_compat.o' security/selinux/Makefile || die "selinux Makefile n
 grep -q 'ksu_avc_log_spoof_matches(tsid)' security/selinux/avc.c || die "avc.c not patched"
 grep -q 'ksu_selinux_hide_read_policy' security/selinux/ss/services.c || die "services.c not patched"
 grep -q 'ksu_selinux_hide_rewrite_status' security/selinux/ss/status.c || die "status.c not patched"
-grep -q 'ksu_avc_spoof_reboot' kernel/reboot.c || die "reboot.c not patched"
+if [[ "$KSU_SUSFS" -eq 0 ]]; then
+    grep -q 'ksu_avc_spoof_reboot' kernel/reboot.c || die "reboot.c not patched"
+fi
 grep -q 'selinux_hide_414.c' "$KSU_DIR/kernel/ksu_main.c" \
     || die "SukiSU still skips selinux_hide.c on 4.14 (5.10-only)"
 [[ -f "$KSU_DIR/kernel/feature/selinux_hide_414.c" ]] || die "selinux_hide_414.c missing"
@@ -1629,12 +1683,16 @@ ok "SELinux hiding + AVC log spoofing wired for 4.14"
 # only needed by the legacy syscall-su path this ref does not use.
 
 if [[ "$MODE" != check ]]; then
-    python3 - "$KSU_DIR/kernel" <<'PY'
+    python3 - "$KSU_DIR/kernel" "$KSU_SUSFS" <<'PY'
 import os
 import re
 import sys
 
 KSU = sys.argv[1]
+# With SUSFS in the build, code under CONFIG_KSU_SUSFS is compiled after
+# all -- section 3.7 applies the port and section 5 sets the symbol -- so
+# hooks living in such branches (ksu_handle_setresuid) become available.
+SUSFS_ON = sys.argv[2] == "1"
 
 # (file, extern block, declaration anchor, insert-after anchor, call block,
 #  symbol, label)
@@ -1790,9 +1848,13 @@ def symbol_available(sym):
                                 hits = susfs_re.search(directive) is not None
                                 skip_branch = hits and not negated
                             elif word == 'ifdef':
-                                skip_branch = 'CONFIG_KSU_SUSFS' in directive
+                                skip_branch = ('CONFIG_KSU_SUSFS' in directive
+                                               and not SUSFS_ON)
                             else:                        # ifndef
-                                skip_branch = 'CONFIG_KSU_SUSFS' not in directive
+                                if 'CONFIG_KSU_SUSFS' in directive:
+                                    skip_branch = SUSFS_ON
+                                else:
+                                    skip_branch = True
                             dead.append(bool(skip_branch))
                         elif word == 'else' and dead:
                             dead[-1] = not dead[-1]
@@ -1903,14 +1965,279 @@ if grep -q 'ksu_handle_setresuid' kernel/sys.c; then
 fi
 ok "manual hook call sites in place ($(grep -l 'ksu_handle' fs/exec.c kernel/reboot.c kernel/sys.c drivers/input/input.c fs/open.c fs/stat.c | wc -l) files)"
 
+# -- 3.7 SUSFS (opt-in: KSU_SUSFS=1) ------------------------------------------
+#
+# SUSFS is a root-hiding layer, and it is *not* something the default build
+# carries: it hooks fs/namei.c, fs/namespace.c, fs/stat.c, fs/super.c and more,
+# and a half-ported version of that is how a working root turns into a
+# bootloop. It is therefore a second, separate product: same tree, same
+# SukiSU-Nova, dispatched with KSU_SUSFS=1.
+#
+# WHAT IS USED, AND WHY
+#   * SukiSU-Nova (pinned) is written against the SUSFS **v2.x** API:
+#     susfs_add_sus_map(), susfs_set_priority_uid_filter(), susfs_show_variant(),
+#     susfs_get_enabled_features(), ... The official 4.14 branch of susfs4ksu
+#     (gitlab.com/simonpunk/susfs4ksu, kernel-4.14) is frozen at **v1.5.5**,
+#     which does not provide them -- linking against it fails.
+#   * There is a device-verified non-GKI 4.14 port of **v2.3.0**
+#     (xiaofan6ya/agate-bakasu-susfs, Linux 4.14.336, MT6893: "boots, root
+#     works, SUSFS reports v2.3.0 with the 2.x feature set over the supercall").
+#     Its sources are ci/susfs/0001-*, and its kernel integration -- generated
+#     for 4.14.357 -- is ci/susfs/0002-*, filtered as described below.
+#   * v2.4.0 ports exist only for 4.9 (wxx9248/susfs4ksu) and 3.10
+#     (ShirkNeko/SukiSU_patch). Neither applies here, and neither is verified on
+#     a 4.14 device. v2.3.0 is the newest *verified* 4.14 line, so that is what
+#     this build uses.
+#
+# WHAT WAS REMOVED FROM THE INTEGRATION PATCH (and why)
+#   * arch/arm64/configs/vayu_defconfig   -- that device's config, not ours.
+#   * fs/proc/task_mmu.c, task_nommu.c, fs/proc/internal.h,
+#     include/linux/pkeys.h, include/linux/kernel.h, lib/vsprintf.c,
+#     fs/seq_file.c, include/linux/seq_file.h
+#         a /proc/pid/maps rewrite that needs a newer seq_file/num_to_str API
+#         (and that API change breaks meminfo.c and of/unittest.c on 4.14).
+#         Dropping it costs CONFIG_KSU_SUSFS_SUS_MAP, which is off below.
+#   * security/selinux/hooks.c   -- a KernelSU-Next NNP bypass, not SUSFS.
+#   * kernel/sys.c               -- KernelSU-Next setresuid glue; the one hunk
+#                                   that matters (spoofed uname) is re-applied
+#                                   below, anchor-checked.
+#   * lib/idr.c, fs/super.c       -- the upstream hunk replaces 4.14's
+#         ida_pre_get()/ida_get_new_above() allocator with ida_alloc_range(),
+#         which 4.14 does not have. fs/super.c is re-generated here: the stock
+#         allocator stays untouched and only the KSU minor-number range branch
+#         is added, so the boot path keeps the code it already boots with.
+#
+# WHAT IS ENABLED
+#   SUS_PATH, SUS_MOUNT, SUS_KSTAT, SPOOF_UNAME, ENABLE_LOG,
+#   HIDE_KSU_SUSFS_SYMBOLS, SPOOF_CMDLINE_OR_BOOTCONFIG -- the set the 4.14
+#   port above verifies on device. SUS_MAP and OPEN_REDIRECT are off (they need
+#   the /proc/pid/maps hunks that were removed), PRIORITY_UID_FILTER is off (it
+#   is a v2.4-only command; SukiSU-Nova's calls for it are compiled out).
+#
+# Four v2.4.0 symbols SukiSU-Nova calls do not exist in v2.3.0; fs/susfs_compat.c
+# provides them as no-ops so the build links, and says so where they matter.
+
+if [[ "$KSU_SUSFS" -eq 1 ]]; then
+
+    for p in ci/susfs/0001-susfs-v2.3.0-source-files.patch \
+             ci/susfs/0002-susfs-4.14-integration.patch; do
+        [[ -f "$p" ]] || die "missing SUSFS patch: $p"
+    done
+
+    if [[ -f fs/susfs.c && -f include/linux/susfs_def.h ]]; then
+        log "  SUSFS sources already present"
+    else
+        patch -p1 --forward --fuzz=3 --no-backup-if-mismatch \
+              -i ci/susfs/0001-susfs-v2.3.0-source-files.patch >/tmp/susfs.$$.log 2>&1 \
+            || { cat /tmp/susfs.$$.log >&2; rm -f /tmp/susfs.$$.log; die "SUSFS source files did not apply"; }
+        rm -f /tmp/susfs.$$.log
+        log "  SUSFS v2.3.0 sources added (fs/susfs.c, include/linux/susfs*.h)"
+    fi
+
+    if grep -q 'susfs_mnt_id_backup' include/linux/mount.h; then
+        log "  SUSFS kernel integration already applied"
+    else
+        patch -p1 --forward --fuzz=3 --no-backup-if-mismatch \
+              -i ci/susfs/0002-susfs-4.14-integration.patch >/tmp/susfs.$$.log 2>&1 \
+            || { cat /tmp/susfs.$$.log >&2; rm -f /tmp/susfs.$$.log; die "SUSFS integration did not apply"; }
+        if grep -q 'FAILED' /tmp/susfs.$$.log; then
+            cat /tmp/susfs.$$.log >&2; rm -f /tmp/susfs.$$.log
+            die "SUSFS integration left failed hunks"
+        fi
+        rm -f /tmp/susfs.$$.log
+        log "  SUSFS kernel integration applied (19 files)"
+    fi
+
+    if find fs include kernel mm security -name '*.rej' 2>/dev/null | grep -q .; then
+        find fs include kernel mm security -name '*.rej' >&2
+        die "SUSFS left .rej files behind"
+    fi
+
+    cat > fs/susfs_compat.c <<'SUSFS_COMPAT_C'
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The seam between SukiSU-Nova and SUSFS v2.3.0 in this tree.
+ *
+ * SukiSU-Nova is written against SUSFS v2.x at the v2.4 level and refers to
+ * four entry points that v2.3.0 does not have. They are implemented here as
+ * no-ops so that the build links; each one only affects the corresponding
+ * v2.4-only refinement, and the comment says what is lost.
+ *
+ * It also owns susfs_is_avc_log_spoofing_enabled, which upstream's 4.14
+ * integration defines in security/selinux/avc.c. This tree instead patches
+ * avc_dump_query() from scripts/ksu-nova-setup.sh (section 3.6), so the flag
+ * needs a home of its own.
+ */
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/string.h>
+#include <linux/susfs.h>
+
+/* Written by susfs_set_avc_log_spoofing() (fs/susfs.c), read by
+ * avc_dump_query() through ksu_avc_log_spoof_matches(). */
+bool susfs_is_avc_log_spoofing_enabled;
+
+/*
+ * v2.3.0 implements susfs_starts_with() (fs/susfs.c) but not its mirror, while
+ * SukiSU-Nova's adb-root check calls both. Same semantics as the sibling.
+ */
+bool susfs_ends_with(const char *str, const char *suffix)
+{
+	size_t str_len = strlen(str);
+	size_t suffix_len = strlen(suffix);
+
+	return str_len >= suffix_len &&
+	       !memcmp(str + str_len - suffix_len, suffix, suffix_len);
+}
+
+/*
+ * v2.4: registers a policy type KernelSU owns, so that SUSFS can treat objects
+ * of that type as its own. v2.3.0 has no equivalent; dropping it means the
+ * type-level refinements of SUS_PATH/SUS_MAP are unavailable, while the path,
+ * mount and kstat hiding this build enables are unaffected.
+ */
+int susfs_add_sus_type(const char *secctx, u32 type_value)
+{
+	return 0;
+}
+
+/*
+ * v2.4: the same for a whole allow rule between two such types. No-op for the
+ * same reason; SUSFS's path/mount hiding does not consult it.
+ */
+int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type,
+				      u32 orig_avd_allowed)
+{
+	return 0;
+}
+
+/*
+ * v2.4: marks the calling process as "not su" for mount hiding. v2.3.0 keys
+ * that decision off the domain instead, so a no-op here makes a few processes
+ * look like su rather than the other way round -- less hiding, never more.
+ */
+void susfs_set_current_proc_no_su(void)
+{
+}
+
+/* v2.4: the same marker for the next zygote generation. Same trade-off. */
+void susfs_set_current_proc_umounted_for_zygote_next(void)
+{
+}
+SUSFS_COMPAT_C
+
+    # Neither helper is declared by the v2.3.0 headers, and a modern clang
+    # rejects the implicit declaration outright.
+    python3 - include/linux/susfs.h <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+decl = (
+    "\n/* v2.3.0 implements susfs_starts_with() in fs/susfs.c and declares neither\n"
+    " * helper, while SukiSU-Nova's adb-root check calls both. The missing half\n"
+    " * is in fs/susfs_compat.c. */\n"
+    "bool susfs_starts_with(const char *str, const char *prefix);\n"
+    "bool susfs_ends_with(const char *str, const char *suffix);\n")
+
+if "susfs_ends_with" in src:
+    print("[ksu-nova]   include/linux/susfs.h: helpers already declared")
+else:
+    open(path, "w").write(src.rstrip("\n") + "\n" + decl)
+    print("[ksu-nova]   include/linux/susfs.h: declared starts_with/ends_with")
+PY
+
+    python3 - fs/Makefile <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+if "susfs_compat.o" in src:
+    print("[ksu-nova]   fs/Makefile: susfs_compat.o already there")
+else:
+    anchor = "obj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
+    if anchor not in src:
+        sys.exit("[ksu-nova] ERROR: fs/Makefile lost the susfs.o line")
+    add = ("# v2.4 entry points SukiSU-Nova calls that SUSFS v2.3.0 lacks, and\n"
+           "# the AVC log spoofing flag (see fs/susfs_compat.c).\n"
+           "obj-$(CONFIG_KSU_SUSFS) += susfs_compat.o\n")
+    open(path, "w").write(src.replace(anchor, anchor + add, 1))
+    print("[ksu-nova]   fs/Makefile: added susfs_compat.o")
+PY
+
+    # The one hunk of the upstream kernel/sys.c diff this build wants: spoofed
+    # uname. Anchor-checked because this vendor tree has its own fake-uname
+    # block inside the same function.
+    python3 - kernel/sys.c <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path)
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+src = once(
+    src,
+    "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n"
+    "{\n"
+    "\tstruct new_utsname tmp;\n"
+    "\n"
+    "\tdown_read(&uts_sem);\n"
+    "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n",
+
+    "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+    "extern void susfs_spoof_uname(struct new_utsname *tmp);\n"
+    "#endif\n"
+    "SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)\n"
+    "{\n"
+    "\tstruct new_utsname tmp;\n"
+    "\n"
+    "\tdown_read(&uts_sem);\n"
+    "\tmemcpy(&tmp, utsname(), sizeof(tmp));\n"
+    "#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+    "\tsusfs_spoof_uname(&tmp);\n"
+    "#endif\n",
+    "kernel/sys.c: spoofed uname for SUSFS")
+
+open(path, "w").write(src)
+PY
+
+    grep -q 'susfs_spoof_uname' kernel/sys.c \
+        || die "SUSFS uname spoof missing from newuname()"
+    grep -q 'susfs_compat.o' fs/Makefile || die "fs/susfs_compat.c not built"
+    grep -q 'susfs_ends_with' fs/susfs_compat.c \
+        || die "susfs_ends_with() missing from the compat file"
+    grep -q 'susfs_ends_with' include/linux/susfs.h \
+        || die "susfs_ends_with() is not declared for Nova"
+    [[ -f fs/susfs.c ]] || die "fs/susfs.c missing"
+    grep -q 'SUSFS_VERSION "v2.3.0"' include/linux/susfs.h \
+        || die "unexpected SUSFS version in include/linux/susfs.h"
+    ok "SUSFS v2.3.0 integrated (19 kernel files + 3 sources + compat)"
+
+else
+    if [[ -e fs/susfs.c || -e include/linux/susfs_compat_placeholder ]]; then
+        warn "SUSFS sources found in a non-SUSFS build; they are inert without CONFIG_KSU_SUSFS"
+    fi
+    log "SUSFS not requested (KSU_SUSFS=0): building the root-only flavour"
+fi
+
 # -------------------------------------------------------------- 5. defconfig ---
 
 if [[ "$MODE" != check ]]; then
-    python3 - "$DEFCONFIG" "$KSU_DIR/kernel/Kconfig" <<'PY'
+    python3 - "$DEFCONFIG" "$KSU_DIR/kernel/Kconfig" "$KSU_SUSFS" <<'PY'
 import re
 import sys
 
-defconfig, kconfig = sys.argv[1], sys.argv[2]
+defconfig, kconfig, susfs_on = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 kconf_text = open(kconfig).read()
 
 
@@ -1944,7 +2271,25 @@ wanted += ["CONFIG_KPM=y"]
 # best. It has to be turned off explicitly, and that switch is also what keeps
 # the faccessat/stat handlers on their 4.14 signatures.
 if has_config("KSU_SUSFS"):
-    wanted.append("# CONFIG_KSU_SUSFS is not set")
+    if susfs_on:
+        # SUSFS v2.3.0 port, section 3.7. The three that stay off need
+        # code this port does not carry (see that section) or a v2.4
+        # command SukiSU-Nova would otherwise send.
+        wanted += [
+            "CONFIG_KSU_SUSFS=y",
+            "CONFIG_KSU_SUSFS_SUS_PATH=y",
+            "CONFIG_KSU_SUSFS_SUS_MOUNT=y",
+            "CONFIG_KSU_SUSFS_SUS_KSTAT=y",
+            "CONFIG_KSU_SUSFS_SPOOF_UNAME=y",
+            "CONFIG_KSU_SUSFS_ENABLE_LOG=y",
+            "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y",
+            "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y",
+            "# CONFIG_KSU_SUSFS_SUS_MAP is not set",
+            "# CONFIG_KSU_SUSFS_OPEN_REDIRECT is not set",
+            "# CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER is not set",
+        ]
+    else:
+        wanted.append("# CONFIG_KSU_SUSFS is not set")
 
 text = open(defconfig).read()
 names = {re.match(r'^(?:# )?(CONFIG_[A-Z0-9_]+)', w).group(1) for w in wanted}
@@ -1984,14 +2329,24 @@ if grep -q '^config KSU_FEATURE_ADBROOT' "$KSU_DIR/kernel/Kconfig"; then
         || die "defconfig missing CONFIG_KSU_FEATURE_ADBROOT=y"
 fi
 grep -qx 'CONFIG_KPM=y' "$DEFCONFIG" || die "defconfig must set CONFIG_KPM=y"
-if grep -qE '^CONFIG_KSU_SUSFS' "$DEFCONFIG"; then
-    die "stale CONFIG_KSU_SUSFS* symbol in defconfig"
-fi
 if grep -q '^config KSU_SUSFS' "$KSU_DIR/kernel/Kconfig"; then
-    grep -qx '# CONFIG_KSU_SUSFS is not set' "$DEFCONFIG" \
-        || die "defconfig must switch CONFIG_KSU_SUSFS off (upstream default is y)"
+    if [[ "$KSU_SUSFS" -eq 1 ]]; then
+        grep -qx 'CONFIG_KSU_SUSFS=y' "$DEFCONFIG" \
+            || die "defconfig does not enable CONFIG_KSU_SUSFS"
+        grep -qx 'CONFIG_KSU_SUSFS_SUS_PATH=y' "$DEFCONFIG" \
+            || die "defconfig does not enable SUSFS SUS_PATH"
+        grep -qx '# CONFIG_KSU_SUSFS_SUS_MAP is not set' "$DEFCONFIG" \
+            || die "SUS_MAP must stay off in this port"
+        ok "defconfig: CONFIG_KSU=y, ADB root on, KPM on, SUSFS v2.3.0 on"
+    else
+        if grep -qE '^CONFIG_KSU_SUSFS' "$DEFCONFIG"; then
+            die "stale CONFIG_KSU_SUSFS* symbol in defconfig"
+        fi
+        grep -qx '# CONFIG_KSU_SUSFS is not set' "$DEFCONFIG" \
+            || die "defconfig must switch CONFIG_KSU_SUSFS off (upstream default is y)"
+        ok "defconfig: CONFIG_KSU=y, ADB root on, KPM on, no SUSFS symbols"
+    fi
 fi
-ok "defconfig: CONFIG_KSU=y, ADB root on, KPM on, no SUSFS symbols"
 
 # ------------------------------------------------------------- 6. checklist ---
 
@@ -2013,7 +2368,22 @@ cat <<EOF
 [ksu-nova]                 snapshot; 4.14 edition of SukiSU's >= 5.10 file),
 [ksu-nova]                 AVC log spoofing (native, driven over the SUSFS
 [ksu-nova]                 reboot() supercall; no SUSFS code involved)
-[ksu-nova]   not included: SUSFS itself (the whole root-hiding layer)
+EOF
+
+if [[ "$KSU_SUSFS" -eq 1 ]]; then
+    cat <<EOF
+[ksu-nova]                 SUSFS v2.3.0 (4.14 port; sus_path, sus_mount,
+[ksu-nova]                 sus_kstat, spoof_uname, enable_log, symbol hiding,
+[ksu-nova]                 cmdline/bootconfig spoofing; sus_map, open_redirect
+[ksu-nova]                 and priority_uid_filter are off by design)
+EOF
+else
+    cat <<EOF
+[ksu-nova]   not included: SUSFS (opt-in: re-run with KSU_SUSFS=1)
+EOF
+fi
+
+cat <<EOF
 [ksu-nova]   next        : scripts/build.sh --clang-dir <clang>/bin
 [ksu-nova]   note        : CONFIG_KSU must still be =y in out/.config after
 [ksu-nova]                 'make olddefconfig'; the workflow asserts that,
