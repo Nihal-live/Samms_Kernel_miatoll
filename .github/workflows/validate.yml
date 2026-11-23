@@ -105,6 +105,14 @@ jobs:
           fi
           grep -qx 'CONFIG_KSU=y' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
           grep -qx '# CONFIG_KPM is not set' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          # 4.14 ports of upstream-5.10-only code must actually be applied.
+          grep -q 'KERNEL_VERSION(4, 14, 0)' KernelSU/kernel/kernel_compat.h \
+            || { echo "::error::cpu_spoof gate is not lowered to 4.14"; exit 1; }
+          grep -q 'asm/vdso_datapage.h' KernelSU/kernel/extension/cpu_spoof.c \
+            || { echo "::error::cpu_spoof lost its pre-4.18 datapage include"; exit 1; }
+          grep -q '< KERNEL_VERSION(4, 18, 0)' KernelSU/kernel/extension/cpu_spoof.c \
+            || { echo "::error::cpu_spoof lost its pre-4.18 vDSO guard"; exit 1; }
+          echo "cpu_spoof ported to 4.14"
           echo "integration applied as expected"
 
       - name: Re-run is read-only

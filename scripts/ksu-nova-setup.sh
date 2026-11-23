@@ -192,8 +192,8 @@ ok "drivers/Makefile + drivers/Kconfig wired"
 
 # ------------------------------------------- 3. SukiSU-Nova 4.14 fixes -------
 #
-# Two upstream conditionals are wrong for 4.14. Both are guarded so that this
-# step fails loudly when upstream rewrites the surrounding code.
+# Four upstream conditionals are wrong for 4.14. Each edit is guarded so that
+# this step fails loudly when upstream rewrites the surrounding code.
 
 if [[ "$MODE" != check ]]; then
     python3 - "$KSU_DIR/kernel/kernel_includes.h" <<'PY'
@@ -248,6 +248,162 @@ PY
 fi
 
 grep -q 'KSU_CAN_USE_KPM' "$KSU_DIR/kernel/kernel_compat.h" || die "KPM guard vanished"
+
+# -- 3.3 CPU identity spoofing on 4.14 ---------------------------------------
+#
+# ksu_extension_cpu_spoof_io() is compiled out below 5.10, so the manager shows
+# CPU identity spoofing as "Unsupported" and the setting cannot be used at all.
+# The gate is a version check, not a missing implementation: the writes are
+# driven by kallsyms lookups and differ only in *which* vDSO fields exist.
+#
+# What 4.14 lacks, and what this patch does about it:
+#
+#   * <vdso/datapage.h> does not exist (arm64 keeps the datapage in
+#     asm/vdso_datapage.h), and struct vdso_data has no clock_mode at all -
+#     it selects the fast path with ->use_syscall.
+#   * struct clocksource has no vdso_clock_mode, and there is no vdso_default.
+#   * ARM64_WORKAROUND_1418040 does not exist (it arrived with the Cortex-A76
+#     erratum in 4.19), so there is no capability bit to clear - and clearing
+#     bit 37 of a bitmap that is shorter than 38 bits would corrupt memory.
+#   * elf_hwcap is a single unsigned long and there is no elf_hwcap2, so the
+#     upstream write of elf_hwcap_bitmap[1] would clobber whatever follows it.
+#
+# Everything the spoof actually changes (MIDR in the per-cpu cpu_data, BogoMIPS
+# via loops_per_jiffy, ELF AT_HWCAP via elf_hwcap) exists unchanged on 4.14, so
+# those writes are kept verbatim.
+
+if [[ "$MODE" != check ]]; then
+    python3 - "$KSU_DIR/kernel/kernel_compat.h" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+want = ("/*\n"
+        " * CPU identity spoofing is symbol-driven: every write it makes goes\n"
+        " * through kallsyms, and the only version-dependent part is which vDSO\n"
+        " * fields exist. cpu_spoof.c compiles the >= 4.18 vDSO writes out below\n"
+        " * that, so the extension is sound on 4.14 as well; upstream only gates\n"
+        " * it at 5.10 because it was never tried on a 4.x datapage.\n"
+        " */\n"
+        "#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)\n"
+        "#define KSU_CAN_USE_CPU_SPOOF\n"
+        "#endif\n")
+old = ("#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+       "#define KSU_CAN_USE_CPU_SPOOF\n"
+       "#endif\n")
+
+if want in src:
+    print("[ksu-nova]   cpu_spoof guard already lowered to 4.14")
+elif old in src:
+    open(path, "w").write(src.replace(old, want, 1))
+    print("[ksu-nova]   lowered cpu_spoof guard from 5.10.0 to 4.14.0")
+else:
+    sys.exit("[ksu-nova] ERROR: cpu_spoof guard anchor missing in " + path
+             + " (upstream changed)")
+PY
+
+    python3 - "$KSU_DIR/kernel/extension/cpu_spoof.c" <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+
+def once(src, old, new, label):
+    if new in src:
+        print("[ksu-nova]   " + label + ": already applied")
+        return src
+    if old not in src:
+        sys.exit("[ksu-nova] ERROR: " + label + " anchor missing in " + path
+                 + " (upstream changed)")
+    print("[ksu-nova]   " + label)
+    return src.replace(old, new, 1)
+
+# (a) the datapage header moved to include/vdso/ in 4.18.
+src = once(
+    src,
+    "#include <asm/cpufeature.h>\n"
+    "#include <vdso/datapage.h>\n"
+    "#include <vdso/clocksource.h>\n",
+
+    "#include <asm/cpufeature.h>\n"
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)\n"
+    "#include <vdso/datapage.h>\n"
+    "#include <vdso/clocksource.h>\n"
+    "#else\n"
+    "/* Before 4.18 the arm64 datapage is arch-local and has no clock_mode. */\n"
+    "#include <asm/vdso_datapage.h>\n"
+    "#endif\n",
+    "guarded the vDSO datapage include")
+
+# (b) elf_hwcap2 does not exist before 4.20 and elf_hwcap[1] would be a
+#     one-element overflow.
+src = once(
+    src,
+    "            elf_hwcap_bitmap[0] = cmd->hwcap;\n"
+    "            elf_hwcap_bitmap[1] = cmd->hwcap2;\n",
+
+    "            elf_hwcap_bitmap[0] = cmd->hwcap;\n"
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n"
+    "            elf_hwcap_bitmap[1] = cmd->hwcap2;\n"
+    "#endif\n",
+    "guarded the elf_hwcap2 write")
+
+# (c) everything that only exists from 4.18 on: clock_mode, clocksource->
+#     vdso_clock_mode, vdso_default and the A76 erratum capability.
+src = once(
+    src,
+    "                part != QCOM_CPU_PART_KRYO_4XX_GOLD) {\n"
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)\n",
+
+    "                part != QCOM_CPU_PART_KRYO_4XX_GOLD) {\n"
+    "#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)\n"
+    "                /*\n"
+    "                 * 4.14: nothing to undo. The vDSO datapage has no\n"
+    "                 * clock_mode, struct clocksource has no\n"
+    "                 * vdso_clock_mode, there is no vdso_default, and the\n"
+    "                 * 1418040 workaround the upstream code clears does not\n"
+    "                 * exist yet - so there is no capability bit to clear and\n"
+    "                 * no reason to touch a bitmap whose length this kernel\n"
+    "                 * does not know. Skipping keeps `missing` at zero instead\n"
+    "                 * of failing the call with -ENXIO over symbols that were\n"
+    "                 * never going to be there.\n"
+    "                 */\n"
+    "#else\n"
+    "#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)\n",
+    "guarded the >= 4.18 vDSO / clocksource / hwcap writes")
+
+src = once(
+    src,
+    "                        pr_warn(\"ksu: set_spoof_cpu failed to resolve 'cpu_hwcaps' / 'system_cpucaps'\\n\");\n"
+    "                        ++missing;\n"
+    "                    }\n"
+    "                }\n"
+    "            }\n",
+
+    "                        pr_warn(\"ksu: set_spoof_cpu failed to resolve 'cpu_hwcaps' / 'system_cpucaps'\\n\");\n"
+    "                        ++missing;\n"
+    "                    }\n"
+    "                }\n"
+    "#endif /* >= 4.18: vDSO clock mode / clocksource / erratum 1418040 */\n"
+    "            }\n",
+    "closed the >= 4.18 guard")
+
+open(path, "w").write(src)
+PY
+fi
+
+# The gate and all three edits must be present in the tree that gets built.
+grep -q 'KSU_CAN_USE_CPU_SPOOF' "$KSU_DIR/kernel/kernel_compat.h" \
+    || die "cpu_spoof gate vanished"
+grep -q 'KERNEL_VERSION(4, 14, 0)' "$KSU_DIR/kernel/kernel_compat.h" \
+    || die "cpu_spoof gate is still 5.10-only; the manager will show it Unsupported"
+grep -q 'asm/vdso_datapage.h' "$KSU_DIR/kernel/extension/cpu_spoof.c" \
+    || die "cpu_spoof.c lost its pre-4.18 datapage include"
+grep -q '< KERNEL_VERSION(4, 18, 0)' "$KSU_DIR/kernel/extension/cpu_spoof.c" \
+    || die "cpu_spoof.c lost its pre-4.18 guard"
+grep -q '>= KERNEL_VERSION(4, 20, 0)' "$KSU_DIR/kernel/extension/cpu_spoof.c" \
+    || die "cpu_spoof.c lost its elf_hwcap2 guard"
 
 # ------------------------------------------------------------- 4. KSU hooks ---
 #
@@ -646,9 +802,10 @@ cat <<EOF
 [ksu-nova]   SukiSU-Nova : ${HEAD_SHA:-unknown}
 [ksu-nova]   defconfig   : $DEFCONFIG
 [ksu-nova]   features    : su compat, kernel umount, sulog, adb root,
-[ksu-nova]                 selinux hide, shell su adb only, mount hide
+[ksu-nova]                 shell su adb only, mount hide, cpu identity spoof
 [ksu-nova]                 (manager-toggled; compiled in unconditionally)
-[ksu-nova]   not included: SUSFS, KPM
+[ksu-nova]   not included: SUSFS, KPM (needs KernelPatch), selinux hide (5.10+),
+[ksu-nova]                 AVC log spoofing (SUSFS-only)
 [ksu-nova]   next        : scripts/build.sh --clang-dir <clang>/bin
 [ksu-nova]   note        : CONFIG_KSU must still be =y in out/.config after
 [ksu-nova]                 'make olddefconfig'; the workflow asserts that,

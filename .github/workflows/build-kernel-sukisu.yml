@@ -145,6 +145,19 @@ jobs:
           awk 'BEGIN{f=0}
                /^SYSCALL_DEFINE/ { if (f) exit; if (index($0, "(setregid,")) f=1; next }
                f && index($0, "ksu_handle") { print "  UNEXPECTED: " $0 }' kernel/sys.c
+          echo "--- cpu_spoof 4.14 port ---"
+          # Without these the manager shows CPU identity spoofing as
+          # "Unsupported" and the panel cannot be opened, so a silently
+          # skipped patch would look like a working build.
+          grep -q 'KERNEL_VERSION(4, 14, 0)' KernelSU/kernel/kernel_compat.h \
+            || { echo "::error::cpu_spoof gate is not lowered to 4.14"; exit 1; }
+          grep -q 'asm/vdso_datapage.h' KernelSU/kernel/extension/cpu_spoof.c \
+            || { echo "::error::cpu_spoof lost its pre-4.18 datapage include"; exit 1; }
+          grep -q '< KERNEL_VERSION(4, 18, 0)' KernelSU/kernel/extension/cpu_spoof.c \
+            || { echo "::error::cpu_spoof lost its pre-4.18 vDSO guard"; exit 1; }
+          grep -q '>= KERNEL_VERSION(4, 20, 0)' KernelSU/kernel/extension/cpu_spoof.c \
+            || { echo "::error::cpu_spoof lost its elf_hwcap2 guard"; exit 1; }
+          echo "cpu_spoof ported to 4.14"
           echo "--- defconfig ---"
           grep -E '^CONFIG_KSU|^CONFIG_KALLSYMS|^# CONFIG_KPM' arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 
@@ -204,6 +217,12 @@ jobs:
             *SKYNET*) ;;
             *) echo "::error::kernel.release does not contain SKYNET: $REL"; exit 1 ;;
           esac
+          # The extension registers itself with a literal name; if LTO had
+          # dropped cpu_spoof the string would be gone and the panel would be
+          # unsupported at runtime even though the sources look right.
+          strings out/vmlinux | grep -qx 'cpu_spoof' || {
+            echo "::error::cpu_spoof extension is not in vmlinux"; exit 1; }
+          echo "cpu_spoof extension present in vmlinux"
           echo "--- boot artefacts ---"
           ls -lh out/arch/arm64/boot/ || true
 

@@ -46,7 +46,7 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 
 - [`scripts/ksu-nova-setup.sh`](scripts/ksu-nova-setup.sh): applies **SukiSU-Nova** (`builtin`,
   pinned commit `4bec532dd`) to a clean checkout — ref validation, `drivers/` wiring, the 4.14
-  hook call sites it can prove are linkable, two 4.14 fixes to the clone and the `CONFIG_KSU*`
+  hook call sites it can prove are linkable, four 4.14 fixes to the clone and the `CONFIG_KSU*`
   defconfig symbols.
   Idempotent, and `--check` re-verifies an integrated tree without changing it.
 - [`.github/workflows/build-kernel-sukisu.yml`](.github/workflows/build-kernel-sukisu.yml): builds
@@ -71,6 +71,37 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
 - **Not boot-tested.** This proves the kernel compiles and links with root integrated, nothing
   more. The previous attempt died at `ld.lld: undefined symbol: ksu_handle_setresuid`, which is
   the failure the symbol gate in the setup script now rules out.
+
+#### CPU identity spoofing on 4.14 (UNTESTED)
+
+- The manager showed *CPU identity spoofing* as unsupported: `KSU_CAN_USE_CPU_SPOOF` is `#if`d
+  at `LINUX_VERSION_CODE >= 5.10`, so neither the extension handler nor the panel existed.
+- That gate is a version check, not missing code — every write goes through kallsyms. The setup
+  script now lowers it to 4.14 and compiles the 4.18-only parts out of `cpu_spoof.c`:
+  `asm/vdso_datapage.h` instead of `<vdso/datapage.h>`, no `elf_hwcap2` write (4.14 has a single
+  `unsigned long elf_hwcap`; `[1]` would corrupt the next symbol), and no vDSO/clocksource block
+  (`clock_mode`, `vdso_clock_mode`, `vdso_default` and erratum 1418040 all postdate 4.14, and
+  clearing bit 37 of a shorter `cpu_hwcaps` bitmap would be an out-of-bounds write).
+- MIDR (`cpu_data[]->reg_midr`), BogoMIPS (`loops_per_jiffy`, kernel `HZ=100`) and `AT_HWCAP`
+  (`elf_hwcap`) do work and are what the panel changes.
+- Verified locally by compiling the whole unity TU with clang for `aarch64-linux-gnu` against
+  this tree's headers: 0 errors, `cpu_spoof` handler and name string present, and the
+  preprocessed output contains no `vdso_time_data`, no `vdso_data_ptr` and no
+  `clear_bit(ARM64_WORKAROUND_1418040`.
+- **Not boot-tested.**
+
+#### KPM and SELinux hide stay unsupported (by construction, not by omission)
+
+- **KPM** is only a bridge: `sukisu_kpm_bridge()` calls KernelPatch's supercall through
+  `__arm64_sys_truncate`, and `.kpm` modules are loaded by KernelPatch. `CONFIG_KPM=y` alone
+  changes nothing — the probe fails, the manager keeps the panel "Unsupported", and KernelPatch's
+  own LKM builds target 5.10-6.18. Integrating KernelPatch into a 4.14 clang-LTO tree is a
+  separate, invasive project, so it is not attempted here.
+- **SELinux hide** (`selinux_hide`, what the settings screen calls "Hide SELinux modification")
+  reimplements selinuxfs against `struct selinux_policy` and other 5.6+ SELinux internals, and
+  its init call is `#if`d at 5.10. This tree has `struct selinux_state` backported but no
+  `selinux_policy`, so a port is a rewrite of ~400 lines of policy internals, not a one-line gate.
+- **AVC log spoofing** is `susfs_set_avc_log_spoofing()` — SUSFS only.
 
 
 ### Removed

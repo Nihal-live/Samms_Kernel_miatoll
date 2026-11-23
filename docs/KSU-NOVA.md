@@ -7,7 +7,8 @@ integration is applied from a clean checkout by
 
 - **No SUSFS.** Root hiding is not part of this build. See
   [Why no SUSFS](#why-no-susfs).
-- **No KPM.** Kernel module (LKM) loading is off. See [Feature matrix](#feature-matrix).
+- **No KPM.** Kernel module (LKM) loading is off — it is a bridge to
+  KernelPatch, which is not part of this kernel. See [Feature matrix](#feature-matrix).
 
 ## What gets installed
 
@@ -20,9 +21,11 @@ tree:
 2. **Wire the module** — `drivers/kernelsu` symlink, `drivers/Makefile` rule and
    `drivers/Kconfig` source line. A stale `CONFIG_WITH_KERNEL_SU` guard left by
    an earlier setup script is normalised to `CONFIG_KSU`.
-3. **Apply two 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
-   exist before 5.10) and raise the KPM guard from 4.4 to 5.10 so KPM's dead
-   code is actually dead.
+3. **Apply four 4.14 fixes** to the clone: guard `linux/static_call.h` (does not
+   exist before 5.10), raise the KPM guard from 4.4 to 5.10 so KPM's dead code
+   is actually dead, lower the CPU-spoof guard from 5.10 to 4.14, and compile
+   the parts of `cpu_spoof.c` that assume a 4.18+ vDSO out of the build. See
+   [CPU identity spoofing](#cpu-identity-spoofing).
 4. **Insert the manual hook call sites** a 4.14 kernel needs — see
    [Hooks](#hooks).
 5. **Inject the defconfig symbols** — `CONFIG_KSU`, `CONFIG_KSU_FEATURE_ADBROOT`,
@@ -44,13 +47,47 @@ compiled in unconditionally; only ADB root and KPM have Kconfig switches.
 | Kernel umount | yes | via Nova's `path_umount()` shim for < 5.9 |
 | sulog (root logging) | yes | runtime toggle |
 | ADB root | yes | `CONFIG_KSU_FEATURE_ADBROOT=y` |
-| SELinux hide | yes | `CONFIG_KSU_SUSFS`-free path |
+| SELinux hide | **no** | `selinux_hide` reimplements selinuxfs against `struct selinux_policy` and other 5.6+ SELinux internals; its init call is `#if`d at 5.10 and this tree has no `selinux_policy`. Porting it means rewriting 400 lines of policy internals — not attempted. |
 | Shell su (adb only) | yes | runtime toggle |
 | Mount hide | yes | needs `mount_list` / `mount_list_lock`, present in this tree |
 | App profile / allowlist / manager tracking | yes | |
-| Extensions (CPU spoof, version spoof, dynamic manager) | yes | |
-| **KPM** (load external kernel modules) | **no** | its own Kconfig help says it "may affect system stability"; needs 5.10+ interfaces |
+| CPU identity spoofing | yes | MIDR + BogoMIPS + ELF `hwcap`; see [CPU identity spoofing](#cpu-identity-spoofing) |
+| Extensions (version spoof, dynamic manager, unmount paths) | yes | |
+| **KPM** (load external kernel modules) | **no** | SukiSU's KPM is only a bridge: it calls KernelPatch's supercall on `__arm64_sys_truncate`. Without KernelPatch in the kernel the probe fails and the manager keeps KPM "Unsupported" even with `CONFIG_KPM=y`. KernelPatch's own LKM builds target 5.10-6.18. |
+| **AVC log spoofing** | **no** | SUSFS-only (`susfs_set_avc_log_spoofing()`) |
 | **SUSFS** | **no** | see below |
+
+## CPU identity spoofing
+
+The manager's *CPU identity spoofing* panel rewrites what `/proc/cpuinfo` and
+the ELF loader report for a CPU: MIDR, BogoMIPS, `AT_HWCAP`, and the vDSO clock
+mode. Upstream compiles it out below 5.10, so the manager shows it as
+unsupported and the panel cannot be opened at all.
+
+The gate is a version check, not missing code. Every write it performs is
+resolved through kallsyms, so the only version-dependent part is *which fields
+exist*. `scripts/ksu-nova-setup.sh` therefore:
+
+- lowers `KSU_CAN_USE_CPU_SPOOF` from 5.10 to 4.14, which registers the
+  extension handler and makes the panel available;
+- includes `asm/vdso_datapage.h` instead of the 4.18+ `<vdso/datapage.h>`;
+- skips the `elf_hwcap_bitmap[1]` write below 4.20 — 4.14's `elf_hwcap` is a
+  single `unsigned long` with no `elf_hwcap2` beside it, so writing the second
+  word would corrupt whatever follows;
+- skips the whole vDSO/clocksource block below 4.18: 4.14's datapage has no
+  `clock_mode`, `struct clocksource` has no `vdso_clock_mode`, there is no
+  `vdso_default`, and the Cortex-A76 erratum 1418040 the upstream code clears
+  does not exist yet. Clearing bit 37 of a shorter `cpu_hwcaps` bitmap would be
+  an out-of-bounds write, so doing nothing is both correct and safer.
+
+What still happens on 4.14 is the part with visible effect: `cpu_data[]->reg_midr`
+(what `/proc/cpuinfo` prints), `loops_per_jiffy` (BogoMIPS, calibrated for this
+kernel's `HZ=100`), and `elf_hwcap` (`AT_HWCAP` for new processes). "vDSO clock
+mode" is a 4.18+ concept — on 4.14 there is no mode to spoof, and the arch-timer
+fast path is already what this device reports.
+
+If a symbol is missing the call returns `-ENXIO` instead of pretending to
+succeed, so a partial spoof is visible rather than silent.
 
 ## Why no SUSFS
 
