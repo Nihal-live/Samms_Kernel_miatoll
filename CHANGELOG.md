@@ -106,7 +106,7 @@ All notable changes to the SKYNET kernel project are documented here. Format fol
   the truncate handler lookup, since `__arm64_sys_*` wrappers only exist from 4.17 — the bridge
   now falls back to `sys_call_table[__NR_truncate]`, then `sys_truncate`/`SyS_truncate`.
 - New [`scripts/kpm-patch.sh`](scripts/kpm-patch.sh) does the half that is not in the kernel: it
-  runs ShirkNeko's `patch_linux` (pinned SukiSU_patch commit) on the built `Image` and rebuilds
+  runs ShirkNeko's `kptools -p` (pinned SukiSU_patch commit) on the built `Image` and rebuilds
   `Image.gz-dtb` as `gzip(patched Image) + the original dtb blob`, then verifies the header magic,
   the KernelPatch marker and that `Image.gz` decompresses to the patched image.
 - The workflow runs it after the build and before packaging, and asserts `CONFIG_KPM=y` and

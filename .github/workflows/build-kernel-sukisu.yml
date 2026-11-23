@@ -244,7 +244,7 @@ jobs:
       - name: Patch image for KPM (KernelPatch)
         # CONFIG_KPM only compiles SukiSU's *bridge*; the loader is
         # KernelPatch, which has to be injected into the built image. This runs
-        # patch_linux and rebuilds Image.gz-dtb around the patched Image.
+        # kptools -p and rebuilds Image.gz-dtb around the patched Image.
         run: |
           set -o pipefail
           ./scripts/kpm-patch.sh 2>&1 | tee "$RUNNER_TEMP/kpm.log"
@@ -256,6 +256,17 @@ jobs:
           BOOT=out/arch/arm64/boot
           strings "$BOOT/Image" | grep -q 'KernelPatch Version' \
             || { echo "::error::Image does not carry KernelPatch after patching"; exit 1; }
+          # The payload's own preset magic. The version string above is rodata
+          # that the payload happens to contain; this is the header kptools
+          # writes and the boot-time patcher scans for, so it cannot be present
+          # in an unpatched image.
+          head -c 8 .kpm-tools/kpm/kpimg | grep -qa 'KP[0-9]' \
+            || { echo "::error::unexpected kpimg payload"; exit 1; }
+          grep -qa "$(head -c 8 .kpm-tools/kpm/kpimg | tr -d '\0')" "$BOOT/Image" \
+            || { echo "::error::Image has no kpimg preset magic"; exit 1; }
+          # Re-running the checker on the final artefact: it validates that
+          # Image.gz is the gzip of Image and that the dtb tail is intact.
+          ./scripts/kpm-patch.sh --check
           echo "patched Image: $(stat -c%s "$BOOT/Image") bytes"
           echo "Image.gz-dtb : $(stat -c%s "$BOOT/Image.gz-dtb") bytes"
           ls -lh "$BOOT" | head -20

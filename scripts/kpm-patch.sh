@@ -11,8 +11,11 @@
 # That is what this script does, with ShirkNeko's prebuilt SukiSU KernelPatch
 # tools (patched KernelPatch whose supercall speaks the SUKISU_KPM_* ABI):
 #
-#   1. run patch_linux on out/arch/arm64/boot/Image   -> oImage
-#   2. sanity check that oImage is still an arm64 Image
+#   1. run kptools -p on out/arch/arm64/boot/Image    -> oImage
+#      (KernelPatch's own CLI. The SukiSU bundle's patch_linux wrapper does the
+#      same thing but hands kptools an embedded kpimg through a memfd, and in
+#      the pinned bundle that payload arrives 16 bytes long -- see section 4.)
+#   2. sanity check that oImage is still an arm64 Image and carries the payload
 #   3. rebuild Image.gz-dtb around it, byte-identically to the kernel's own
 #      rule: gzip(Image) + the DTB blob that was appended to the original
 #
@@ -71,16 +74,42 @@ check_image() {
         || die "$f does not look like an arm64 Image (header magic $magic)"
 }
 
-# KernelPatch leaves its version string in the injected blob, so its presence
-# is how an already-patched image is recognised.
+# The injected payload starts with its own preset magic, which is the marker
+# kptools itself scans for. Section 4 re-reads it from the kpimg file that is
+# actually used; this default only has to cover the idempotency check that runs
+# before the tools are fetched.
+KPIMG_MAGIC="${KPIMG_MAGIC:-KP1158}"
 already_patched() {
-    grep -qa 'KernelPatch Version' "$1"
+    grep -qa -- "$KPIMG_MAGIC" "$1"
+}
+
+# Image.gz has to decompress to Image, and Image.gz-dtb has to be exactly that
+# gzip stream followed by the device tree blob. Decompressing Image.gz-dtb
+# itself proves nothing: gzip reports the appended dtb as trailing garbage,
+# which is how the kernel's own Makefile builds it.
+verify_repack() {
+    [[ -f "$BOOT_DIR/Image.gz" && -f "$BOOT_DIR/Image.gz-dtb" ]] || return 0
+    gzip -dc "$BOOT_DIR/Image.gz" | cmp -s - "$BOOT_DIR/Image" \
+        || die "Image.gz no longer decompresses to Image"
+    local gz_size dtb_start
+    gz_size="$(stat -c%s "$BOOT_DIR/Image.gz")"
+    head -c "$gz_size" "$BOOT_DIR/Image.gz-dtb" | cmp -s - "$BOOT_DIR/Image.gz" \
+        || die "Image.gz-dtb does not start with Image.gz"
+    dtb_start="$(tail -c +$((gz_size + 1)) "$BOOT_DIR/Image.gz-dtb" | od -An -tx1 -N4 | tr -d ' \n')"
+    [[ "$dtb_start" == "d00dfeed" ]] \
+        || die "Image.gz-dtb does not end with a device tree blob (got $dtb_start)"
+    ok "Image.gz decompresses to Image; Image.gz-dtb is gzip + dtb"
 }
 
 check_image "$BOOT_DIR/Image"
 
 if already_patched "$BOOT_DIR/Image"; then
     ok "Image already carries KernelPatch, nothing to do"
+    # --check and a re-run both land here; the payload files still have to be
+    # consistent, which is most of the point of checking.
+    if [[ -f "$BOOT_DIR/Image.gz" && -f "$BOOT_DIR/Image.gz-dtb" ]]; then
+        verify_repack
+    fi
     exit 0
 fi
 
@@ -90,7 +119,7 @@ fi
 
 # --------------------------------------------------------------- 1. tools ---
 
-if [[ ! -x "$TOOL_DIR/kpm/patch_linux" ]]; then
+if [[ ! -x "$TOOL_DIR/kpm/kptools-linux" || ! -f "$TOOL_DIR/kpm/kpimg" ]]; then
     log "fetching SukiSU KernelPatch tools (${SUKISU_PATCH_REF:0:12})"
     rm -rf "$TOOL_DIR"
     mkdir -p "$TOOL_DIR"
@@ -103,7 +132,7 @@ if [[ ! -x "$TOOL_DIR/kpm/patch_linux" ]]; then
         || die "cannot check out ${SUKISU_PATCH_REF}"
     ok "tools at $(git -C "$TOOL_DIR" rev-parse --short HEAD)"
 fi
-chmod +x "$TOOL_DIR/kpm/patch_linux"
+chmod +x "$TOOL_DIR/kpm/kptools-linux"
 
 # --------------------------------------------------- 2. remember the layout --
 
@@ -142,41 +171,77 @@ fi
 
 # ------------------------------------------------------------ 4. patch it ---
 
-log "patching Image with patch_linux"
+# KernelPatch's CLI, not the SukiSU bundle's patch_linux wrapper.
+#
+# patch_linux decrypts an embedded kpimg into a memfd and execs kptools with
+# "-k /proc/self/fd/N". In the pinned bundle that descriptor comes out as a
+# 16-byte file, so the patched image reported success while carrying no
+# payload at all:
+#
+#   [+] layout kimg: 0x0,0x2930810, kpimg: 0x2931000,0x10, ...   <- 16 bytes
+#   [+] kpimg version: 0
+#   [+] kpimg compile time:
+#
+# kpimg is shipped next to kptools in the same directory, and can be inspected
+# before it is used, so the payload is passed through from there. The arguments
+# are the ones patch_linux uses, including its superkey.
+KPTOOLS="$TOOL_DIR/kpm/kptools-linux"
+KPIMG="$TOOL_DIR/kpm/kpimg"
+KPM_SUPERKEY="${KPM_SUPERKEY:-123}"
 
-# patch_linux reports failures with a "[-] file:line/function(): reason" line
-# and still exits 0, so its exit status says nothing. Keep its output, and turn
-# every line of it into a workflow annotation: a failure here happens after a
-# fifteen-minute build, and the runner's log is not always reachable.
+[[ -x "$KPTOOLS" ]] || die "no kptools in $TOOL_DIR/kpm"
+[[ -f "$KPIMG" ]] || die "no kpimg in $TOOL_DIR/kpm (kptools needs the payload)"
+
+KPIMG_SIZE="$(stat -c%s "$KPIMG")"
+KPIMG_MAGIC="$(head -c 8 "$KPIMG" | tr -d '\0')"
+[[ "$KPIMG_MAGIC" =~ ^KP[0-9]+$ ]] \
+    || die "kpimg does not start with a KernelPatch preset magic ('$KPIMG_MAGIC')"
+log "kpimg: ${KPIMG_MAGIC}, ${KPIMG_SIZE} bytes"
+"$KPTOOLS" -k "$KPIMG" -l 2>&1 | sed 's/^/[kpm] payload: /' || true
+
+log "patching Image with kptools -p"
 PATCH_LOG="$(mktemp)"
 patch_rc=0
-( cd "$BOOT_DIR" && "$TOOL_DIR/kpm/patch_linux" Image ) 2>&1 | tee "$PATCH_LOG" || patch_rc=$?
+set +e
+"$KPTOOLS" -p -s "$KPM_SUPERKEY" -i "$BOOT_DIR/Image" -k "$KPIMG" \
+    -o "$BOOT_DIR/oImage" 2>&1 | tee "$PATCH_LOG"
+patch_rc=${PIPESTATUS[0]}
+set -e
+
 ann() {
     if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
         printf '::error file=scripts/kpm-patch.sh::%s\n' "${1//%/}"
     fi
 }
 if (( patch_rc != 0 )); then
-    while IFS= read -r line; do ann "patch_linux: $line"; done < "$PATCH_LOG"
-    die "patch_linux exited $patch_rc"
+    while IFS= read -r line; do ann "kptools: $line"; done < "$PATCH_LOG"
+    die "kptools exited $patch_rc"
 fi
 if grep -q '^\[-\]' "$PATCH_LOG"; then
-    while IFS= read -r line; do ann "patch_linux: $line"; done < <(grep '^\[-\]' "$PATCH_LOG")
-    die "patch_linux reported a failure: $(grep -m1 '^\[-\]' "$PATCH_LOG")"
+    while IFS= read -r line; do ann "kptools: $line"; done < <(grep '^\[-\]' "$PATCH_LOG")
+    die "kptools reported a failure: $(grep -m1 '^\[-\]' "$PATCH_LOG")"
 fi
 
-# Kept until the image is accepted: the messages below quote it.
 if [[ ! -f "$BOOT_DIR/oImage" ]]; then
-    while IFS= read -r line; do ann "patch_linux: $line"; done < <(grep '^\[-\]' "$PATCH_LOG" 2>/dev/null || true)
-    die "patch_linux did not produce oImage (output: $(tr '\n' ' ' < "$PATCH_LOG" 2>/dev/null))"
+    die "kptools did not produce oImage (output: $(tr '\n' ' ' < "$PATCH_LOG"))"
 fi
 check_image "$BOOT_DIR/oImage"
 already_patched "$BOOT_DIR/oImage" \
-    || die "oImage does not contain KernelPatch (patch_linux output looks wrong)"
+    || die "oImage does not carry the ${KPIMG_MAGIC} payload -- the image was patched without it"
 
 ORIG_SIZE="$(stat -c%s "$BOOT_DIR/Image")"
 NEW_SIZE="$(stat -c%s "$BOOT_DIR/oImage")"
-log "Image ${ORIG_SIZE} -> ${NEW_SIZE} bytes (+$((NEW_SIZE - ORIG_SIZE)))"
+GROWTH=$((NEW_SIZE - ORIG_SIZE))
+log "Image ${ORIG_SIZE} -> ${NEW_SIZE} bytes (+${GROWTH})"
+# The layout is 4K-aligned image + kpimg + extra items, so the file has to
+# grow by at least the payload. Anything less means the payload was dropped,
+# which is exactly the failure mode this bypasses.
+(( GROWTH >= KPIMG_SIZE )) \
+    || die "Image only grew by ${GROWTH} bytes, less than the ${KPIMG_SIZE}-byte payload"
+
+# kptools can read the result back; keep that in the log, it is the same
+# parser the boot-time patcher uses.
+"$KPTOOLS" -l -i "$BOOT_DIR/oImage" 2>&1 | sed 's/^/[kpm] oImage: /' || true
 
 mv -f "$BOOT_DIR/oImage" "$BOOT_DIR/Image"
 rm -f "$PATCH_LOG"
@@ -196,17 +261,12 @@ fi
 # ------------------------------------------------------------- 6. verify ---
 
 already_patched "$BOOT_DIR/Image" || die "patched Image lost KernelPatch"
-if [[ -f "$BOOT_DIR/Image.gz-dtb" ]]; then
-    # Image.gz must decompress to exactly the patched Image, and Image.gz-dtb
-    # must be that gzip stream plus the original dtb blob, byte for byte.
-    # (Decompressing Image.gz-dtb itself is not a test: gzip reports the dtb as
-    # trailing garbage, which is exactly how the kernel builds it.)
-    gzip -dc "$BOOT_DIR/Image.gz" | cmp -s - "$BOOT_DIR/Image" \
-        || die "Image.gz no longer decompresses to Image"
+verify_repack
+if [[ -n "$DTB_BLOB" ]]; then
+    # The rebuilt payload must still be the original dtb blob, byte for byte.
     GZ_SIZE="$(stat -c%s "$BOOT_DIR/Image.gz")"
     [[ "$(stat -c%s "$BOOT_DIR/Image.gz-dtb")" -eq "$((GZ_SIZE + DTB_SIZE))" ]] \
         || die "Image.gz-dtb is not Image.gz + the original dtb blob"
-    ok "Image.gz decompresses to the patched Image; dtb blob intact"
 fi
 
 log "KPM ready: the image carries KernelPatch, CONFIG_KPM=y is in the kernel"

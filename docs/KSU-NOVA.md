@@ -69,9 +69,29 @@ It needs two halves, and only one of them is a Kconfig switch:
    syscall handler. If the handler answers with `SUKISU_KPM_ABI_VERSION`, the
    bridge forwards the real op. Without KernelPatch it simply returns
    `-EOPNOTSUPP`, which is why `CONFIG_KPM=y` on its own changes nothing.
-2. **The loader** (KernelPatch). `scripts/kpm-patch.sh` runs `patch_linux` from
+2. **The loader** (KernelPatch). `scripts/kpm-patch.sh` runs `kptools -p` from
    ShirkNeko's [SukiSU_patch](https://github.com/ShirkNeko/SukiSU_patch) on the
    built `Image` and rebuilds `Image.gz-dtb` around the patched result.
+
+`kptools` is called directly rather than through the bundle's `patch_linux`
+wrapper. The wrapper decrypts an embedded `kpimg` into a memfd and passes
+`-k /proc/self/fd/N` to `kptools`; in the pinned bundle that file comes out
+16 bytes long, and the image is written with an empty payload while the wrapper
+still reports success:
+
+```
+[+] layout kimg: 0x0,0x2930810, kpimg: 0x2931000,0x10, ...    <- 16-byte payload
+[+] kpimg version: 0
+[+] kpimg compile time:
+```
+
+Calling `kptools` with the `kpimg` that ships next to it does the same patch
+(same arguments, including the wrapper's superkey) with a payload that can be
+inspected first: `kptools -k kpimg -l` reports `version=0xe00`,
+`config=android,release`, `arch=arm64`. The script then verifies the result
+instead of trusting the exit status: the payload's own preset magic (`KP1158`)
+must be present in the output, the file must grow by at least the payload size,
+and `Image.gz` must decompress to the patched `Image`.
 
 ### The 4.14 ports
 
@@ -93,8 +113,9 @@ the table entry or the function body.
   the kernel's `_stext`/kallsyms rather than source. kpimg reports
   `3.18 - 6.6 (theoretically)`; this 4.14 image is at the old end of that claim
   and is the one part of this integration that cannot be verified without
-  booting. `scripts/kpm-patch.sh` refuses to continue if `patch_linux` fails or
-  if the result no longer looks like an arm64 Image, so a bad patch fails the
+  booting. `scripts/kpm-patch.sh` refuses to continue if `kptools` fails, if the
+  result no longer looks like an arm64 Image, if the payload magic is missing,
+  or if the file did not grow by the payload size, so a bad patch fails the
   build instead of producing a zip.
 - **`.kpm` modules must be built for 4.14 arm64.** A module built against a 5.x
   kernel will not load, and a broken module is the one thing that can panic the
