@@ -241,6 +241,15 @@ jobs:
             echo "::error::cpu_spoof extension is not in vmlinux"; exit 1; }
           echo "cpu_spoof extension present in vmlinux"
 
+          # KernelPatch only installs its KPM hook when it can see the
+          # __arm64_sys_* names; the shim provides them on 4.14. If LTO dropped
+          # either one, the panel would be dead and nothing else would say so.
+          grep -qw '__arm64_sys_truncate' out/System.map \
+            || { echo "::error::__arm64_sys_truncate is missing from System.map (KPM would be unavailable)"; exit 1; }
+          grep -qw '__arm64_sys_openat' out/System.map \
+            || { echo "::error::__arm64_sys_openat is missing from System.map"; exit 1; }
+          echo "KernelPatch wrapper shim present in System.map"
+
       - name: Patch image for KPM (KernelPatch)
         # CONFIG_KPM only compiles SukiSU's *bridge*; the loader is
         # KernelPatch, which has to be injected into the built image. This runs

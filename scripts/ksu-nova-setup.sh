@@ -416,6 +416,128 @@ grep -q 'KSU_TASK_HAS_THREAD_PID' "$KSU_DIR/kernel/extension/kpm/super_access.c"
 grep -q 'KSU_TASK_HAS_THREAD_PID' "$KSU_DIR/kernel/Makefile" \
     || die "the clone Makefile does not define KSU_TASK_HAS_THREAD_PID"
 
+# -- 3.5 KernelPatch's pre-4.17 detection ------------------------------------
+#
+# The KPM bridge is only half of KPM. The other half is the KernelPatch payload
+# injected into the built image, and *it* decides whether to install the channel
+# that answers the bridge:
+#
+#     int sukisu_kpm_supercall_install(void)
+#     {
+#         if (!has_syscall_wrapper) return -EOPNOTSUPP;          /* 4.14 stops here */
+#         addr = kallsyms_lookup_name("__arm64_sys_truncate");   /* 4.17+ name */
+#         ...
+#     }
+#
+# has_syscall_wrapper is set by looking for __arm64_sys_openat, and the hook
+# target is looked up as __arm64_sys_truncate. Neither symbol exists before
+# 4.17, so on this kernel the payload logs
+#
+#     KP syscall has_wrapper: 0
+#     KP sukisu_kpm_supercall_install done: -95
+#
+# and the manager greys KPM out while everything else works -- measured on the
+# device, not guessed.
+#
+# Two stub symbols fix the detection without touching the payload: nothing in
+# this kernel calls them, sys_call_table keeps pointing at sys_truncate and
+# sys_openat, and the only caller of __arm64_sys_truncate becomes the KPM
+# bridge, which the payload intercepts at the first instruction. If the hook is
+# *not* installed the stub answers -ENOSYS, so the bridge reports "unavailable"
+# exactly as it does today: the failure mode is the current behaviour, not a
+# wrong answer and not a crash.
+
+if [[ "$MODE" != check ]]; then
+    cat > arch/arm64/kernel/kp_syswrap.c <<'KPEOF'
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * kp_syswrap.c - the syscall-wrapper symbols KernelPatch looks for.
+ *
+ * KernelPatch's KPM channel is an inline hook on the truncate syscall wrapper.
+ * Its payload decides whether it may install that hook by looking for
+ * __arm64_sys_openat, then resolves __arm64_sys_truncate by name. Both symbols
+ * arrived with the SYSCALL_DEFINE wrapper generation in 4.17; on this kernel
+ * the payload therefore reports "has_wrapper: 0" and installs nothing.
+ *
+ * These stubs exist so the detection succeeds. Nothing in the kernel calls
+ * them: sys_call_table still points at sys_truncate/sys_openat, and the only
+ * caller of __arm64_sys_truncate is SukiSU's KPM bridge, which KernelPatch
+ * intercepts before the first instruction runs. If the hook is not installed,
+ * the stub answers -ENOSYS, which the bridge reports as "KPM unavailable" -
+ * the same state as without this file.
+ *
+ * The padding nops are not decoration: the inline hook relocates the first
+ * instructions of its target, and a bare "mov w0, #-38; ret" leaves it two.
+ */
+#include <linux/linkage.h>
+#include <linux/ptrace.h>
+#include <linux/errno.h>
+#include <linux/compiler.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
+
+asmlinkage long __arm64_sys_truncate(const struct pt_regs *regs);
+asmlinkage long __arm64_sys_openat(const struct pt_regs *regs);
+
+#define KP_SYSWRAP_PAD(regs)                                                  \
+	asm volatile("nop; nop; nop; nop; nop; nop; nop; nop" ::"r"(regs)     \
+		     : "memory")
+
+asmlinkage __visible __used noinline long
+__arm64_sys_truncate(const struct pt_regs *regs)
+{
+	KP_SYSWRAP_PAD(regs);
+	return -ENOSYS;
+}
+
+asmlinkage __visible __used noinline long
+__arm64_sys_openat(const struct pt_regs *regs)
+{
+	KP_SYSWRAP_PAD(regs);
+	return -ENOSYS;
+}
+
+/*
+ * LTO links this tree as one unit and is free to drop a function nothing calls.
+ * Taking the addresses in a used array keeps both names in kallsyms, and the
+ * build asserts that they are in System.map, so a toolchain that still manages
+ * to remove them fails the build instead of shipping a kernel whose KPM panel
+ * is silently dead.
+ */
+static void *const kp_syswrap_keep[] __used = {
+	(void *)__arm64_sys_truncate,
+	(void *)__arm64_sys_openat,
+};
+
+#endif /* < 4.17 */
+KPEOF
+
+    python3 - arch/arm64/kernel/Makefile <<'PY'
+import sys
+
+path = sys.argv[1]
+src = open(path).read()
+line = "obj-$(CONFIG_KPM) += kp_syswrap.o\n"
+if line in src:
+    print("[ksu-nova]   kp_syswrap.o: already in arch/arm64/kernel/Makefile")
+else:
+    if not src.endswith("\n"):
+        src += "\n"
+    src += (
+        "\n# KernelPatch's KPM channel needs the __arm64_sys_* names to exist;\n"
+        "# see arch/arm64/kernel/kp_syswrap.c. Only built when KPM is enabled.\n" + line
+    )
+    open(path, "w").write(src)
+    print("[ksu-nova]   added kp_syswrap.o to arch/arm64/kernel/Makefile")
+PY
+fi
+
+[[ -f arch/arm64/kernel/kp_syswrap.c ]] \
+    || die "arch/arm64/kernel/kp_syswrap.c was not created"
+grep -q 'obj-\$(CONFIG_KPM) += kp_syswrap.o' arch/arm64/kernel/Makefile \
+    || die "arch/arm64/kernel/Makefile does not build kp_syswrap.o"
+
 # -- 3.3 CPU identity spoofing on 4.14 ---------------------------------------
 #
 # ksu_extension_cpu_spoof_io() is compiled out below 5.10, so the manager shows
@@ -970,8 +1092,9 @@ cat <<EOF
 [ksu-nova]   defconfig   : $DEFCONFIG
 [ksu-nova]   features    : su compat, kernel umount, sulog, adb root,
 [ksu-nova]                 shell su adb only, mount hide, cpu identity spoof,
-[ksu-nova]                 KPM (CONFIG_KPM=y; the built Image must still be
-[ksu-nova]                 post-processed by KernelPatch's patch_linux)
+[ksu-nova]                 KPM (CONFIG_KPM=y + the __arm64_sys_* shim;
+[ksu-nova]                 the built Image must still be post-processed by
+[ksu-nova]                 KernelPatch's kptools)
 [ksu-nova]                 (manager-toggled; compiled in unconditionally)
 [ksu-nova]   not included: SUSFS, selinux hide (needs 5.6+ SELinux internals),
 [ksu-nova]                 AVC log spoofing (SUSFS-only)
