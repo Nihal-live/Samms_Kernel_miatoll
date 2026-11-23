@@ -2135,17 +2135,32 @@ path = sys.argv[1]
 src = open(path).read()
 
 decl = (
-    "\n/* v2.3.0 implements susfs_starts_with() in fs/susfs.c and declares neither\n"
+    "/*\n"
+    " * v2.3.0 implements susfs_starts_with() in fs/susfs.c and declares neither\n"
     " * helper, while SukiSU-Nova's adb-root check calls both. The missing half\n"
-    " * is in fs/susfs_compat.c. */\n"
+    " * is in fs/susfs_compat.c.\n"
+    " */\n"
     "bool susfs_starts_with(const char *str, const char *prefix);\n"
-    "bool susfs_ends_with(const char *str, const char *suffix);\n")
+    "bool susfs_ends_with(const char *str, const char *suffix);\n"
+    "\n/*\n"
+    " * v2.4 entry points SukiSU-Nova calls from sucompat.c and lsm_hook.c.\n"
+    " * v2.3.0 keys the same decision off the domain instead (see\n"
+    " * fs/susfs_compat.c), so they are no-ops -- but the calls need a\n"
+    " * declaration: clang rejects an implicit one, and the first SUSFS build\n"
+    " * failed on exactly that.\n"
+    " */\n"
+    "void susfs_set_current_proc_no_su(void);\n"
+    "void susfs_set_current_proc_umounted_for_zygote_next(void);\n")
 
-if "susfs_ends_with" in src:
-    print("[ksu-nova]   include/linux/susfs.h: helpers already declared")
+if "susfs_set_current_proc_no_su" in src:
+    print("[ksu-nova]   include/linux/susfs.h: compat entry points already declared")
 else:
-    open(path, "w").write(src.rstrip("\n") + "\n" + decl)
-    print("[ksu-nova]   include/linux/susfs.h: declared starts_with/ends_with")
+    # Inside the include guard, not after it.
+    at = src.rstrip().rfind("#endif")
+    if at < 0:
+        sys.exit("[ksu-nova] ERROR: include/linux/susfs.h has no trailing #endif")
+    open(path, "w").write(src[:at] + decl + "\n" + src[at:])
+    print("[ksu-nova]   include/linux/susfs.h: declared the compat entry points")
 PY
 
     python3 - fs/Makefile <<'PY'
@@ -2218,6 +2233,8 @@ PY
         || die "susfs_ends_with() missing from the compat file"
     grep -q 'susfs_ends_with' include/linux/susfs.h \
         || die "susfs_ends_with() is not declared for Nova"
+    grep -q 'susfs_set_current_proc_no_su' include/linux/susfs.h \
+        || die "susfs_set_current_proc_no_su() is not declared for Nova"
     [[ -f fs/susfs.c ]] || die "fs/susfs.c missing"
     grep -q 'SUSFS_VERSION "v2.3.0"' include/linux/susfs.h \
         || die "unexpected SUSFS version in include/linux/susfs.h"

@@ -80,6 +80,13 @@ jobs:
           done
           grep -q 'susfs_ends_with' include/linux/susfs.h \
             || { echo "::error::susfs_ends_with() is not declared for Nova"; exit 1; }
+          # Declarations matter as much as definitions: clang rejects an
+          # implicit declaration, which is what the first SUSFS build died on.
+          for sym in susfs_set_current_proc_no_su \
+                     susfs_set_current_proc_umounted_for_zygote_next; do
+            grep -q "$sym" include/linux/susfs.h \
+              || { echo "::error::$sym is not declared for Nova"; exit 1; }
+          done
 
           # The 4.14 IDA allocator survives: the port adds a branch, it does
           # not replace ida_pre_get()/ida_get_new_above() with the 4.19 API.
