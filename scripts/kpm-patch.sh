@@ -129,13 +129,47 @@ if [[ -f "$BOOT_DIR/Image.gz-dtb" ]]; then
     ok "dtb blob: ${DTB_SIZE} bytes"
 fi
 
-# ------------------------------------------------------------ 3. patch it ---
+# --------------------------------------------------------- 3. diagnostics ---
+
+# If patch_linux rejects the image, these are the facts that decide whether it
+# is the image or the tool: the version strings it scans for, and the version
+# of the payload it injects.
+log "image: $(stat -c%s "$BOOT_DIR/Image") bytes"
+log "kernel release: $(strings "$BOOT_DIR/Image" | grep -m1 '^Linux version ' || echo '<not found>')"
+if [[ -x "$TOOL_DIR/kpm/kptools-linux" ]]; then
+    "$TOOL_DIR/kpm/kptools-linux" -k "$TOOL_DIR/kpm/kpimg" -l 2>&1 | sed 's/^/[kpm] payload: /' || true
+fi
+
+# ------------------------------------------------------------ 4. patch it ---
 
 log "patching Image with patch_linux"
-( cd "$BOOT_DIR" && "$TOOL_DIR/kpm/patch_linux" Image ) \
-    || die "patch_linux failed -- see its output above"
 
-[[ -f "$BOOT_DIR/oImage" ]] || die "patch_linux did not produce oImage"
+# patch_linux reports failures with a "[-] file:line/function(): reason" line
+# and still exits 0, so its exit status says nothing. Keep its output, and turn
+# every line of it into a workflow annotation: a failure here happens after a
+# fifteen-minute build, and the runner's log is not always reachable.
+PATCH_LOG="$(mktemp)"
+patch_rc=0
+( cd "$BOOT_DIR" && "$TOOL_DIR/kpm/patch_linux" Image ) 2>&1 | tee "$PATCH_LOG" || patch_rc=$?
+ann() {
+    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        printf '::error file=scripts/kpm-patch.sh::%s\n' "${1//%/}"
+    fi
+}
+if (( patch_rc != 0 )); then
+    while IFS= read -r line; do ann "patch_linux: $line"; done < "$PATCH_LOG"
+    die "patch_linux exited $patch_rc"
+fi
+if grep -q '^\[-\]' "$PATCH_LOG"; then
+    while IFS= read -r line; do ann "patch_linux: $line"; done < <(grep '^\[-\]' "$PATCH_LOG")
+    die "patch_linux reported a failure: $(grep -m1 '^\[-\]' "$PATCH_LOG")"
+fi
+
+# Kept until the image is accepted: the messages below quote it.
+if [[ ! -f "$BOOT_DIR/oImage" ]]; then
+    while IFS= read -r line; do ann "patch_linux: $line"; done < <(grep '^\[-\]' "$PATCH_LOG" 2>/dev/null || true)
+    die "patch_linux did not produce oImage (output: $(tr '\n' ' ' < "$PATCH_LOG" 2>/dev/null))"
+fi
 check_image "$BOOT_DIR/oImage"
 already_patched "$BOOT_DIR/oImage" \
     || die "oImage does not contain KernelPatch (patch_linux output looks wrong)"
@@ -145,9 +179,10 @@ NEW_SIZE="$(stat -c%s "$BOOT_DIR/oImage")"
 log "Image ${ORIG_SIZE} -> ${NEW_SIZE} bytes (+$((NEW_SIZE - ORIG_SIZE)))"
 
 mv -f "$BOOT_DIR/oImage" "$BOOT_DIR/Image"
+rm -f "$PATCH_LOG"
 ok "Image patched"
 
-# ------------------------------------------------------- 4. repack payload ---
+# ------------------------------------------------------- 5. repack payload ---
 
 if [[ -n "$DTB_BLOB" ]]; then
     gzip -n -f -9 < "$BOOT_DIR/Image" > "$BOOT_DIR/Image.gz"
@@ -158,7 +193,7 @@ else
     log "no Image.gz-dtb in this build; only Image was patched"
 fi
 
-# ------------------------------------------------------------- 5. verify ---
+# ------------------------------------------------------------- 6. verify ---
 
 already_patched "$BOOT_DIR/Image" || die "patched Image lost KernelPatch"
 if [[ -f "$BOOT_DIR/Image.gz-dtb" ]]; then

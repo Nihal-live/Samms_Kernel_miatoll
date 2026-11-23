@@ -245,7 +245,10 @@ jobs:
         # CONFIG_KPM only compiles SukiSU's *bridge*; the loader is
         # KernelPatch, which has to be injected into the built image. This runs
         # patch_linux and rebuilds Image.gz-dtb around the patched Image.
-        run: ./scripts/kpm-patch.sh
+        run: |
+          set -o pipefail
+          ./scripts/kpm-patch.sh 2>&1 | tee "$RUNNER_TEMP/kpm.log"
+          exit "${PIPESTATUS[0]}"
 
       - name: Verify KPM patch
         run: |
@@ -275,9 +278,21 @@ jobs:
             echo "# build failure on $(date -u +%FT%TZ) — $(git rev-parse --short HEAD)"
             echo
             echo '```'
-            grep -n -B4 -A12 -E "error:|Error [0-9]+$|undefined reference|No rule to make" "$LOG" \
-              | head -400 || tail -n 200 "$LOG"
+            {
+              grep -n -B4 -A12 -E "error:|Error [0-9]+$|undefined reference|No rule to make" "$LOG" \
+                | head -400 || tail -n 200 "$LOG"
+            }
             echo '```'
+            # The KPM step runs after the build and has its own log; when the
+            # build itself succeeded, this is the failure text.
+            if [ -s "$RUNNER_TEMP/kpm.log" ]; then
+              echo
+              echo '## KPM patch step'
+              echo
+              echo '```'
+              tail -n 120 "$RUNNER_TEMP/kpm.log"
+              echo '```'
+            fi
           } > /tmp/ci-log/build-failure.md
           cd /tmp/ci-log
           git init -q .
