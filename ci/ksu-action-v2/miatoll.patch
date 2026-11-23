@@ -12,10 +12,10 @@ index e324ce6..d558fa0 100644
            - backslashxx
 diff --git a/config/miatoll.env b/config/miatoll.env
 new file mode 100644
-index 0000000..5762128
+index 0000000..66e290b
 --- /dev/null
 +++ b/config/miatoll.env
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,107 @@
 +# Build profile: Xiaomi Redmi Note 9 Pro / Poco M2 Pro (miatoll), SKYNET kernel.
 +#
 +#   Linux 4.14.357-openela, Clang + LLD, CONFIG_LOCALVERSION=-SKYNET
@@ -45,8 +45,19 @@ index 0000000..5762128
 +# ends in android- unless CLANG_TRIPLE names the real target triple, which is
 +# why that goes in CUSTOM_CMDS. CONFIG_LLVM_POLLY has to go as well: the
 +# prebuilt Clang has no Polly and the defconfig turns it on for LTO.
++#
++# HOSTLDFLAGS=-B/usr/bin is not cosmetic. proton-clang's bin/ contains an old
++# GNU ld (the NDK one), and the toolchain's directory is in PATH, so the host
++# link of scripts/basic/fixdep picks it up and dies on a modern glibc:
++#
++#   .../clang/bin/ld: /usr/lib/x86_64-linux-gnu/libc.so.6: unknown type [0x13]
++#   section '.relr.dyn'  ->  collect2: error: ld returned 1 exit status
++#   make[2]: *** [scripts/Makefile.host:102: scripts/basic/fixdep] Error 1
++#
++# -B/usr/bin points the host compiler at the system binutils for that link,
++# before the defconfig stage needs fixdep.
 +CUSTOM_CMDS:CLANG_TRIPLE=aarch64-linux-gnu-
-+EXTRA_CMDS:LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
++EXTRA_CMDS:LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip HOSTLDFLAGS=-B/usr/bin
 +
 +# =================================================================== Clang ===
 +#

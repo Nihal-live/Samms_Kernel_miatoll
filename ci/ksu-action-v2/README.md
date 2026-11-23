@@ -11,6 +11,16 @@ compatible with this tree, but it needs three small additions for it:
 | `scripts/patches.sh` | the KPM step delegates to this tree's `scripts/kpm-patch.sh`, which owns the gz+dtb repacking |
 | `config/miatoll.env` | the device profile: source repo, branch, defconfig, Clang, KPM on, no SUSFS |
 
+Two things in that profile are there because of how this tree builds, not
+because of the device:
+
+* `CUSTOM_CMDS:CLANG_TRIPLE=aarch64-linux-gnu-` -- the Makefile refuses to build
+  when `CROSS_COMPILE` ends in `android-` and the Clang target is not overridden.
+* `EXTRA_CMDS:... HOSTLDFLAGS=-B/usr/bin` -- proton-clang's `bin/` ships an old
+  GNU `ld` that is ahead of `/usr/bin` in `PATH`, and the host link of
+  `scripts/basic/fixdep` fails on it (`unknown type [0x13] section .relr.dyn`),
+  which surfaces as a defconfig failure before anything is compiled.
+
 All four are in [`miatoll.patch`](miatoll.patch), which applies on top of
 KernelSU_Action_V2 `26c1b95532` (2026-10-25):
 
