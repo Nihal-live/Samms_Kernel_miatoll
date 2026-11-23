@@ -392,7 +392,7 @@ jobs:
             | --- | --- |
             | SukiSU-Nova | committed in `scripts/ksu-nova-setup.sh` (`KSU_REF`) |
             | root hiding | ${{ inputs.susfs == 'true' && 'SUSFS v2.3.0 (4.14 port)' || 'none' }} |
-            | SUSFS | ${{ inputs.susfs == 'true' && 'sus_path, sus_mount, sus_kstat, spoof_uname, cmdline', sus_map/open_redirect/priority_uid_filter off' || 'not included' }} |
+            | SUSFS | ${{ inputs.susfs == 'true' && 'sus_path, sus_mount, sus_kstat, spoof_uname, cmdline; sus_map/open_redirect/priority_uid_filter off' || 'not included' }} |
             | KPM | on (`CONFIG_KPM=y` + KernelPatch image patch) |
             | source | `${{ github.sha }}` on `${{ github.ref_name }}` |
 
